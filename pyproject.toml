@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigf"
-version = "2.4.0"
+version = "2.4.1"
 description = "Bi-directional macromolecular diffraction MTZ/mmCIF simulator (F0 -> F, SIGF) and blind inverse experimental parameter solver (F, SIGF -> beamline, crystal, mount, & processing forensics)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,6 +35,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 
+[project.optional-dependencies]
+calibration = ["scipy>=1.8"]
+
 [project.urls]
 Repository = "https://github.com/jmholton/SIGF"
 
@@ -43,9 +46,4 @@ sim-reso-mtz = "sim_reso_mtz:main"
 deduce-mtz-params = "deduce_mtz_params:main"
 
 [tool.setuptools]
-py-modules = ["sim_reso_mtz", "deduce_mtz_params", "build_calibration_v2"]
-include-package-data = true
-
-[tool.setuptools.package-data]
-"*" = ["nanobragg2_calibration.json"]
-
+py-modules = ["sim_reso_mtz", "deduce_mtz_params"]

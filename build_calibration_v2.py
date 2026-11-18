@@ -14,21 +14,29 @@ so sim_reso_mtz.py reproduces:
      outer-corner background offset beta_bg(u) + per-seed radial-ring fluctuation sigma_bg_cor.
 """
 
+import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import gemmi
 import numpy as np
-from scipy.optimize import least_squares
+
+try:
+    from scipy.optimize import least_squares
+except ImportError as exc:
+    raise ImportError(
+        "scipy is required to rebuild nanobragg2_calibration.json; install with `pip install \"sigf[calibration]\"` or `pip install scipy`."
+    ) from exc
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import sim_reso_mtz as sm
 
-NB2 = Path("/home/jamesh/projects/resolution/challenge/1aho_Bfac/nanoBragg2")
+DEFAULT_NB2 = Path(os.environ.get("NANOBRAGG2_DIR", "/home/jamesh/projects/resolution/challenge/1aho_Bfac/nanoBragg2"))
 
 U_T_KNOTS = [
     0.0, 0.16, 0.26, 0.35, 0.44, 0.52, 0.60, 0.67, 0.74,
@@ -62,7 +70,15 @@ def nl_ramp(u_arr, bw, dnl):
     return np.interp(u_arr, [u_lo, u_hi], [0.0, dnl])
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Rebuild nanobragg2_calibration.json from training seeds .01-.05.")
+    ap.add_argument("--nb2-dir", type=Path, default=DEFAULT_NB2, help="Directory containing FrightB0.mtz, reso_summary_10x.txt, and proc*/FreeRed.mtz.")
+    ap.add_argument("-o", "--out", type=Path, default=HERE / "nanobragg2_calibration.json", help="Output calibration JSON path.")
+    args = ap.parse_args(argv)
+    NB2 = args.nb2_dir
+    if not (NB2 / "FrightB0.mtz").is_file():
+        raise FileNotFoundError(f"nanoBragg2 directory missing FrightB0.mtz: {NB2} (pass --nb2-dir <path>)")
+
     t0 = time.perf_counter()
     b0 = gemmi.read_mtz_file(str(NB2 / "FrightB0.mtz"))
     a0_gt = np.array(b0, copy=False)
@@ -814,7 +830,7 @@ def main():
         "xdsconv_params": {"half_win_records": 100, "clamped": True, "min_isigi": -3.0, "min_score": -35.0},
         "rows": cal_rows,
     }
-    dst = HERE / "nanobragg2_calibration.json"
+    dst = args.out
     dst.write_text(json.dumps(out_cal, indent=2) + "\n")
     print(f"\nWrote {dst} ({len(cal_rows)} rows) in {time.perf_counter()-t0:.1f} s")
 

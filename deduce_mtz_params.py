@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,13 +66,12 @@ from sim_reso_mtz import (
     NB2_REF,
     _F_AIR_GRID,
     _F_WATER_GRID,
-    _GL_U,
-    _GL_WU,
     _STOL_GRID,
     compute_cc12_from_sigi,
     compute_symmetry_factors,
     dist_from_dedge,
     f_prot_sq,
+    french_wilson_vectorized,
     interpolate_calibration,
     interpolate_calibration_by_dedge,
     nonbragg_incoherent_f2,
@@ -104,42 +104,24 @@ _FW_TABLE_CACHE: Optional[Dict[str, np.ndarray]] = None
 
 
 def _get_fw_tables() -> Dict[str, np.ndarray]:
-    """Build exact 1D French-Wilson posterior moment tables over z = I/sigI - gamma*sigI/Sigma."""
+    """Build exact 1D French-Wilson posterior moment tables over z = I/sigI - gamma*sigI/Sigma
+    using the single shared french_wilson_vectorized integrator from sim_reso_mtz."""
     global _FW_TABLE_CACHE
     if _FW_TABLE_CACHE is not None:
         return _FW_TABLE_CACHE
 
-    z_grid = np.linspace(-12.0, 28.0, 4001, dtype=np.float64)
-    r_cut = 8.5
+    z_grid = np.linspace(-20.0, 28.0, 4801, dtype=np.float64)
+    ones = np.ones_like(z_grid)
+    huge_prior = np.full_like(z_grid, 1e18)
 
-    def _moments(is_cen: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        y2_lo = np.where(z_grid > r_cut, z_grid - r_cut, 0.0)
-        y2_hi = np.where(
-            z_grid >= 0.0,
-            z_grid + r_cut,
-            (r_cut * r_cut) / (np.sqrt(z_grid * z_grid + r_cut * r_cut) - z_grid),
-        )
-        y_lo = np.sqrt(y2_lo)
-        y_hi = np.sqrt(np.maximum(y2_hi, 1e-12))
-        dy = y_hi - y_lo
-        y = y_lo[:, None] + dy[:, None] * _GL_U[None, :]
-        y2 = y * y
-        neg = z_grid < 0.0
-        log_w = np.empty_like(y)
-        log_w[~neg] = -0.5 * ((y2[~neg] - z_grid[~neg, None]) ** 2)
-        log_w[neg] = -0.5 * (y2[neg] * y2[neg]) + z_grid[neg, None] * y2[neg]
-        if not is_cen:
-            log_w += np.log(np.maximum(y, 1e-300))
-        log_w -= np.max(log_w, axis=1, keepdims=True)
-        w = np.exp(log_w) * _GL_WU[None, :]
-        z0 = np.sum(w, axis=1)
-        mu = np.sum(w * y, axis=1) / z0
-        m2 = np.sum(w * y2, axis=1) / z0
-        sd = np.sqrt(np.maximum(m2 - mu * mu, 1e-12))
-        return mu, sd, mu / sd
-
-    mu_ac, sd_ac, r_ac = _moments(False)
-    mu_cen, sd_cen, r_cen = _moments(True)
+    mu_ac, sd_ac = french_wilson_vectorized(
+        z_grid, ones, huge_prior, np.zeros(len(z_grid), dtype=bool), min_isigi=-1e9
+    )
+    mu_cen, sd_cen = french_wilson_vectorized(
+        z_grid, ones, huge_prior, np.ones(len(z_grid), dtype=bool), min_isigi=-1e9
+    )
+    r_ac = mu_ac / np.maximum(sd_ac, 1e-12)
+    r_cen = mu_cen / np.maximum(sd_cen, 1e-12)
     _FW_TABLE_CACHE = {
         "z": z_grid,
         "mu_ac": mu_ac,
@@ -450,7 +432,7 @@ def reciprocal_cartesian_matrix(cell: gemmi.UnitCell) -> np.ndarray:
 
 def build_theoretical_asu_lattice(
     cell: gemmi.UnitCell, spacegroup: gemmi.SpaceGroup, d_min_limit: float, d_max_limit: float = 1000.0
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[str]]:
     """Generate all symmetry-unique non-absent ASU reflections (hkls, d) down to d_min_limit."""
     d_lim = max(0.35, float(d_min_limit) * 0.999999)
     max_h = int(math.ceil(cell.a / d_lim)) + 1
@@ -498,13 +480,17 @@ def build_theoretical_asu_lattice(
                 asu_hkls_list.append(np.asarray(kept, dtype=np.int32))
 
         if not asu_hkls_list:
-            return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64)
+            return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64), "empty_asu_lattice"
         asu_hkls = np.vstack(asu_hkls_list)
         sc_all = asu_hkls @ orth_frac.T
         asu_d = 1.0 / np.sqrt(np.sum(sc_all * sc_all, axis=1))
-        return asu_hkls, asu_d
-    except Exception:
-        return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64)
+        return asu_hkls, asu_d, None
+    except Exception as exc:
+        print(
+            f"WARNING: Failed to build theoretical ASU lattice ({exc}); completeness and blind-cone checks disabled.",
+            file=sys.stderr,
+        )
+        return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64), str(exc)
 
 
 def canonicalize_hkls_to_asu(spacegroup: gemmi.SpaceGroup, hkls: np.ndarray) -> np.ndarray:
@@ -607,13 +593,20 @@ def analyze_amplitude_conversion_and_detruncate(
                 inferred_mode = "xdsconv"
                 # XDSCONV cuts on raw I/SIGI >= -3.0 (allowing prior-shifted h = I/SIGI - SIGI/<I> down to -35)
                 inferred_min_isigi = -3.0
+                z_min_tbl = float(fw["z"][0])
                 z_eff_low = float(np.interp(min_cen, fw["r_cen"], fw["z"])) if np.isfinite(min_cen) else -4.5
+                z_note = (
+                    f"min J_eff <= {z_min_tbl:+.1f} [table floor]"
+                    if z_eff_low <= z_min_tbl + 0.05
+                    else f"min J_eff = {z_eff_low:+.2f}"
+                )
                 software_label = (
                     f"Kabsch XDSCONV (WILSON_STATISTICS=TRUE, separate F+/F- French-Wilson + 0.5*(F++F-), "
-                    f"I/SIGI >= -3.0 cut; min J_eff = {z_eff_low:+.2f})"
+                    f"I/SIGI >= -3.0 cut; {z_note})"
                 )
             else:
                 inferred_mode = "ccp4"
+                z_min_tbl = float(fw["z"][0])
                 z_ac = float(np.interp(min_ac, fw["r_ac"], fw["z"]))
                 z_cen = float(np.interp(min_cen, fw["r_cen"], fw["z"])) if np.isfinite(min_cen) and len(cen_vals) >= 10 else z_ac
                 z_est = 0.7 * z_ac + 0.3 * z_cen
@@ -627,7 +620,8 @@ def analyze_amplitude_conversion_and_detruncate(
                     )
                 elif z_est < -4.18:
                     inferred_min_isigi = round(max(-6.0, z_est), 2)
-                    software_label = f"Merged French-Wilson with permissive negative-I tail (J_eff_min = {z_est:+.2f})"
+                    j_str = f"<= {z_min_tbl:+.1f} [table floor]" if z_est <= z_min_tbl + 0.05 else f"= {z_est:+.2f}"
+                    software_label = f"Merged French-Wilson with permissive negative-I tail (J_eff_min {j_str})"
                 else:
                     inferred_min_isigi = round(min(2.0, z_est + 0.25), 2)
                     software_label = f"Merged French-Wilson (TRUNCATE/ctruncate-like; J_eff_min = {z_est:+.2f})"
@@ -649,8 +643,16 @@ def analyze_amplitude_conversion_and_detruncate(
         min_isig_direct = float(np.min(isig_vals))
         info["n_valid_I"] = int(np.sum(vi))
         info["min_isigi_direct"] = min_isig_direct
-        if min_isig_direct < 0.0:
-            info["inferred_min_isigi"] = round(min_isig_direct, 2)
+        # Note: IMEAN is untruncated, so min(IMEAN/SIGIMEAN) is NOT the I->F cutoff!
+        # Only refine inferred_min_isigi from IMEAN when merged ccp4 F has rejected (NaN) rows bracketing a sharp cut.
+        if has_f and info.get("truncate_mode") == "ccp4":
+            assert f_obs is not None and sig_f is not None
+            f_on_vi = np.isfinite(f_obs[vi]) & np.isfinite(sig_f[vi]) & (sig_f[vi] > 0.0)
+            if np.any(f_on_vi) and np.any(~f_on_vi):
+                max_rej = float(np.max(isig_vals[~f_on_vi]))
+                min_surv = float(np.min(isig_vals[f_on_vi]))
+                if max_rej <= min_surv + 0.05:
+                    info["inferred_min_isigi"] = round(0.5 * (max_rej + min_surv), 2)
 
         if has_f:
             assert f_obs is not None and sig_f is not None
@@ -780,8 +782,10 @@ def detect_geometry_and_pass_boundaries(
     d_min_obs = float(np.min(d_obs))
     d_max_obs = float(np.max(d_obs))
 
-    asu_hkls, asu_d = build_theoretical_asu_lattice(cell, spacegroup, d_min_obs, d_max_limit=max(d_max_obs * 1.05, 50.0))
-    obs_asu = canonicalize_hkls_to_asu(spacegroup, hkls_obs)
+    asu_hkls, asu_d, lattice_err = build_theoretical_asu_lattice(
+        cell, spacegroup, d_min_obs, d_max_limit=max(d_max_obs * 1.05, 50.0)
+    )
+    obs_asu = canonicalize_hkls_to_asu(spacegroup, hkls_obs) if len(asu_d) > 0 else hkls_obs
 
     has_lattice = len(asu_d) > 0
     if has_lattice:
@@ -1059,6 +1063,7 @@ def detect_geometry_and_pass_boundaries(
 
     return {
         "has_asu_lattice": has_lattice,
+        "lattice_error": lattice_err,
         "asu_d": asu_d,
         "asu_present": asu_present,
         "overall_completeness": overall_compl,
@@ -1069,6 +1074,23 @@ def detect_geometry_and_pass_boundaries(
         "low_angle_overloads": overload_info,
         "pass_boundaries": changepoints,
     }
+
+
+def _crossing_d(
+    sh_d_a: np.ndarray,
+    metric_arr: np.ndarray,
+    thresh: float,
+    d_fallback: Optional[float] = None,
+) -> Tuple[float, bool]:
+    """Interpolate resolution d (A) where metric_arr drops below thresh (from high-d to low-d)."""
+    fb = float(d_fallback) if d_fallback is not None else (float(np.min(sh_d_a)) if len(sh_d_a) > 0 else 0.0)
+    if len(metric_arr) == 0 or np.all(metric_arr >= thresh):
+        return fb, False
+    for idx in range(len(metric_arr) - 1):
+        if metric_arr[idx] >= thresh and metric_arr[idx + 1] < thresh:
+            frac = (metric_arr[idx] - thresh) / max(metric_arr[idx] - metric_arr[idx + 1], 1e-9)
+            return float(sh_d_a[idx] + frac * (sh_d_a[idx + 1] - sh_d_a[idx])), True
+    return float(sh_d_a[0]), True
 
 
 # ==============================================================================
@@ -1104,14 +1126,20 @@ def estimate_absolute_electron_wilson(
         k0_abs_e2 = e2_per_residue * n_res_cell
         vm_est = v_cell / max(n_res_cell * 110.0, 1.0)
         f_solv_est = float(np.clip(1.0 - 1.23 / max(vm_est, 1.25), 0.15, 0.85))
+        scale_is_assumed = False
         scale_basis = f"n_residues_asu={n_residues_asu} ({int(n_res_cell)} res/cell)"
     else:
+        scale_is_assumed = True
         f_solv_est = float(solvent_content) if solvent_content is not None else 0.47
         f_solv_est = float(np.clip(f_solv_est, 0.10, 0.88))
         v_prot = (1.0 - f_solv_est) * v_cell
         n_res_cell = v_prot / 135.3
         k0_abs_e2 = e2_per_residue * n_res_cell
-        scale_basis = f"Matthews_volume (solvent={100*f_solv_est:.1f}%, ~{n_res_cell/n_sym:.0f} res/ASU)"
+        tag_s = "USER-ASSUMED" if solvent_content is not None else "ASSUMED default"
+        scale_basis = (
+            f"Matthews_volume [{tag_s}: solvent={100*f_solv_est:.1f}%, ~{n_res_cell/n_sym:.0f} res/ASU; "
+            f"pass --n-residues for exact scale]"
+        )
 
     s2_v = s2[valid]
     d_v = d[valid]
@@ -1152,20 +1180,10 @@ def estimate_absolute_electron_wilson(
     sh_is_a = np.asarray(sh_isig, dtype=np.float64)
     sh_n_a = np.asarray(sh_n, dtype=np.float64)
 
-    def _crossing_d(metric_arr: np.ndarray, thresh: float) -> Tuple[float, bool]:
-        if len(metric_arr) == 0:
-            return float(np.min(d_v)), False
-        if np.all(metric_arr >= thresh):
-            return float(np.min(d_v)), False
-        for idx in range(len(metric_arr) - 1):
-            if metric_arr[idx] >= thresh and metric_arr[idx + 1] < thresh:
-                frac = (thresh - metric_arr[idx]) / max(abs(metric_arr[idx + 1] - metric_arr[idx]), 1e-9)
-                return float(sh_d_a[idx] + frac * (sh_d_a[idx + 1] - sh_d_a[idx])), True
-        return float(sh_d_a[0]), True
-
-    d_cc12, cc12_crossed = _crossing_d(sh_cc_a, 0.30)
-    d_isig15, isig15_crossed = _crossing_d(sh_is_a, 1.50)
-    d_isig20, isig20_crossed = _crossing_d(sh_is_a, 2.00)
+    d_min_v = float(np.min(d_v))
+    d_cc12, cc12_crossed = _crossing_d(sh_d_a, sh_cc_a, 0.30, d_min_v)
+    d_isig15, isig15_crossed = _crossing_d(sh_d_a, sh_is_a, 1.50, d_min_v)
+    d_isig20, isig20_crossed = _crossing_d(sh_d_a, sh_is_a, 2.00, d_min_v)
 
     # Universal Debye-Babinet radial modulation D_prot(s) allows reliable shells down to d = 9 A (s2 >= 0.003)!
     sh_s_mag = np.sqrt(sh_s2_a)
@@ -1230,6 +1248,7 @@ def estimate_absolute_electron_wilson(
         "k_amp_file_per_e": float(k_amp_file_per_e),
         "scale_i_file_per_e2": float(scale_i_file_per_e2),
         "scale_basis": scale_basis,
+        "scale_is_assumed": bool(scale_is_assumed),
         "f_solvent_est": float(f_solv_est),
         "n_res_asu_est": float(n_res_cell / n_sym),
         "B_form_apparent": float(b_form_apparent),
@@ -1239,6 +1258,7 @@ def estimate_absolute_electron_wilson(
         "d_file_min": float(np.min(d_v)),
         "d_file_max": float(np.max(d_v)),
         "d_cc12_030": float(d_cc12),
+        "d_est_cc12_from_sigi_030": float(d_cc12),
         "cc12_crossed": bool(cc12_crossed),
         "completeness_d_ge_cc12": float(compl_cc12),
         "d_isig15": float(d_isig15),
@@ -1770,11 +1790,18 @@ def deduce_physical_parameters_and_replay(
         cli_parts.append(f"--calib-err {est_calib_err:.4f}")
 
     return {
+        "assumptions": {
+            "scale_is_assumed": bool(wilson_info.get("scale_is_assumed", True)),
+            "solvent_fraction_used": round(float(wilson_info["f_solvent_est"]), 4),
+            "assumed_nominal_wavelength_A": round(float(lam_nom), 4),
+            "cc12_estimated_from_sigi_not_halfdatasets": True,
+        },
         "darwin_invariant_phi_V_lam3_um_A3": float(darwin_prod_um_a3),
         "wavelength_bounds_A": {
             "practical_flat_detector_max_2th65": lam_practical_max,
             "physical_backscatter_max_2th180": lam_backscatter_max,
             "cu_kalpha_1p54A_ruled_out": cu_ka_ruled_out,
+            "assumed_nominal_wavelength_for_LP_and_dose_A": round(float(lam_nom), 4),
         },
         "crystal_size_lower_bounds": {
             "active_regime": "Room-temperature capillary" if is_rt else "Cryogenic (100 K)",
@@ -2157,6 +2184,11 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
     pd = res["physical_deduction"]
     sa = res["optional_sdfac_audit"]
 
+    compl_hdr = (
+        f"{100*gp['overall_completeness']:.1f}%"
+        if np.isfinite(gp["overall_completeness"])
+        else f"unavailable ({gp.get('lattice_error')})"
+    )
     lines = [
         f"=== Inverse Diffraction Parameter Deduction ({res['elapsed_ms']:.1f} ms) ===",
         f"  File / Format     : {fm['path']} ({fm['format']})",
@@ -2164,7 +2196,7 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
         f"  Columns analyzed  : F={fm['columns_used']['F']},{fm['columns_used']['SIGF']} | "
         f"I={fm['columns_used']['I']},{fm['columns_used']['SIGI']} [{fm['columns_used']['sigma_source']}]",
         f"  Reflections       : {fm['n_valid_reflections']} valid / {fm['n_rows_total']} rows "
-        f"(d = {wr['d_file_max']:.2f} .. {wr['d_file_min']:.4f} A, compl = {100*gp['overall_completeness']:.1f}%)",
+        f"(d = {wr['d_file_max']:.2f} .. {wr['d_file_min']:.4f} A, compl = {compl_hdr})",
         "",
         "1. Intensity -> Amplitude Conversion & Resolution Cutoff:",
         f"  Software / Cutoff : {ac['software']}",
@@ -2175,11 +2207,15 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
             f"centric min = {ac['min_fsigf_centric']:.4f} (n_cen = {ac['n_centric_F']})"
         )
     if ac.get("has_I_columns"):
-        lines.append(f"  Direct I/SIGI min : {ac['min_isigi_direct']:+.3f} sigma")
+        lines.append(f"  Direct I/SIGI min : {ac['min_isigi_direct']:+.3f} sigma (untruncated IMEAN extremum)")
 
-    cc_note = f"{wr['d_cc12_030']:.3f} A" if wr["cc12_crossed"] else f"< {wr['d_file_min']:.3f} A (outer CC1/2 = {wr['outer_shell_cc12']:.3f}, <I/sigI> = {wr['outer_shell_isig']:.2f})"
+    cc_note = (
+        f"{wr['d_cc12_030']:.3f} A"
+        if wr["cc12_crossed"]
+        else f"< {wr['d_file_min']:.3f} A (outer est. CC1/2 = {wr['outer_shell_cc12']:.3f}, <I/sigI> = {wr['outer_shell_isig']:.2f})"
+    )
     lines.append(
-        f"  Resolution limits : file d_min = {wr['d_file_min']:.3f} A | CC1/2=0.30 at {cc_note} | "
+        f"  Resolution limits : file d_min = {wr['d_file_min']:.3f} A | est. CC1/2(SIGI)=0.30 at {cc_note} | "
         f"<I/sigI>=2.0 at {wr['d_isig20']:.3f} A"
     )
     lines.append(
@@ -2262,6 +2298,13 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
     wb = pd["wavelength_bounds_A"]
     cs = pd["crystal_size_lower_bounds"]
     nb = pd["nanobragg2_equivalent"]
+    assump = pd.get("assumptions", {})
+    lam_assump = assump.get("assumed_nominal_wavelength_A", 0.98)
+    sc_assump_tag = (
+        f" [uses assumed solvent={100*assump.get('solvent_fraction_used', 0.47):.0f}%]"
+        if assump.get("scale_is_assumed", False)
+        else ""
+    )
     cu_str = " [1.54 A Cu K-alpha RULED OUT -> synchrotron/Mo]" if wb["cu_kalpha_1p54A_ruled_out"] else ""
     hdr_wl = f" (file header wavelength = {fm['header_wavelength_A_not_used_in_blind_fit']:.4f} A, unused)" if fm["header_wavelength_A_not_used_in_blind_fit"] else ""
     lines.extend(
@@ -2269,15 +2312,15 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
             "",
             "5. Deduceable Physical Invariants, Inequalities & nanoBragg2-Equivalent Setup:",
             f"  Darwin invariant  : Phi_tot * V_illum * lambda^3 * DQE = {pd['darwin_invariant_phi_V_lam3_um_A3']:.3e} ph * um * A^3 "
-            f"({nb['photon_budget_ratio_vs_nb2']:.3f}x nanoBragg2 baseline)",
+            f"({nb['photon_budget_ratio_vs_nb2']:.3f}x nanoBragg2 baseline; LP at assumed lambda~{lam_assump:.2f}A{sc_assump_tag})",
             f"  Wavelength bound  : lambda <= {wb['practical_flat_detector_max_2th65']:.3f} A (flat det 2th<=65d), "
             f"< {wb['physical_backscatter_max_2th180']:.3f} A (2th<180d){cu_str}{hdr_wl}",
             f"  Min crystal size  : >= {cs['min_edge_um_cryo_20MGy']:.1f} um at 100K cryo (<=20 MGy) | "
             f">= {cs['min_edge_um_RT_30kGy']:.0f}-{cs['min_edge_um_RT_2kGy_low_decay']:.0f} um at RT capillary (30-2 kGy) "
-            f"[active: {cs['active_regime']}]",
+            f"[active: {cs['active_regime']}; assumes lambda~{lam_assump:.2f}A{sc_assump_tag}]",
             f"  nanoBragg2 equiv  : L_xtal = {nb['equiv_xtal_edge_um_at_nb2_fluence']:.2f} um (V = {nb['equiv_xtal_vol_um3_at_nb2_fluence']:.0f} um^3) "
             f"at 4e10 ph/um^2 [or t_exp = {nb['equiv_exposure_s_at_nb2_xtal']:.2f} s at 26 um xtal], "
-            f"water ~ {nb['inferred_water_um']} um, air ~ {nb['inferred_air_mm']} mm, calib_err ~ {100*nb['inferred_calib_err']:.2f}%",
+            f"water ~ {nb['inferred_water_um']} um, air ~ {nb['inferred_air_mm']} mm, calib_err ~ {100*nb['inferred_calib_err']:.2f}%{sc_assump_tag}",
             f"  Replay CLI        : {pd['suggested_replay_command']}",
         ]
     )

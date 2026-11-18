@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-sim_reso_mtz.py — Fast empirical nanoBragg2 / XDS / Aimless / XDSCONV simulator for MTZ files (v2.2).
+sim_reso_mtz.py — Bi-directional nanoBragg2 / XDS / Aimless / XDSCONV diffraction simulator & inverse solver (v2.4.1).
 
-Given a ground-truth structure-factor MTZ (F0) and a desired resolution limit d_min (Å),
-this tool:
+Given a ground-truth structure-factor MTZ (F0) and a desired resolution limit d_min (Å) [or physical beam,
+crystal, background, mechanical, and dose parameters, or --deduce for blind inverse forensics], this tool:
   1. Maps d_min to the calibrated Wilson B-factor B_Wilson(d_min), detector edge/corner geometry
      (d_edge, d_corner, d_mtz_min), 18-knot deterministic XDS spot-profile transfer curve T_xds(u),
      high-u within-shell profile/summation capture non-linearity delta_nl_u1, Voronoi detector/beamstop
@@ -465,6 +465,7 @@ def has_experimental_overrides(args: argparse.Namespace) -> bool:
             getattr(args, "spindle_vel_err", None) is not None,
             int(getattr(args, "n_det_pos", 1) or 1) != 1,
             getattr(args, "dose_mgy", None) is not None,
+            getattr(args, "rad_b_per_mgy", None) is not None,
             float(getattr(args, "d_min", 2.0)) <= 0.0,
         ]
     )
@@ -603,7 +604,8 @@ def resolve_experimental_config(
         s_lumped ** 2 + s_flicker ** 2 + s_jitter ** 2 + s_vib ** 2 + s_wobble ** 2
     )
 
-    rad_b_per_mgy = float(getattr(args, "rad_b_per_mgy", NB2_REF["rad_b_per_mgy"]))
+    raw_rad_b = getattr(args, "rad_b_per_mgy", None)
+    rad_b_per_mgy = float(raw_rad_b) if raw_rad_b is not None else NB2_REF["rad_b_per_mgy"]
     if getattr(args, "dose_mgy", None) is not None:
         dose_mgy = max(0.0, float(args.dose_mgy))
     elif getattr(args, "auto_dose", False):
@@ -612,6 +614,12 @@ def resolve_experimental_config(
         dose_mgy = (fluence_um2 / 2.0e10) * ((wavelength / 1.0) ** 2)
     else:
         dose_mgy = 0.0
+        if raw_rad_b is not None and not getattr(args, "quiet", False):
+            print(
+                "WARNING: --rad-b-per-mgy was specified without --dose-mgy or --auto-dose; "
+                "radiation dose defaults to 0.0 MGy unless --dose-mgy or --auto-dose is also given.",
+                file=sys.stderr,
+            )
 
     delta_b_rad = max(0.0, rad_b_per_mgy * dose_mgy)
 
@@ -622,13 +630,16 @@ def resolve_experimental_config(
     gamma_vol = v_illum / NB2_REF["xtal_vol_um3"]
     gamma_wave_bragg = (wavelength / NB2_REF["wavelength_A"]) ** 3
     gamma_wave_bg = (wavelength / NB2_REF["wavelength_A"]) ** 2
-    # Exact Darwin unit-cell scaling relative to sim_reso_mtz's k0-normalized units:
-    # N_photons / N_photons_v22 = (V_cell_0 / V_cell)^2 * (k0_in / k0_ref)
-    gamma_cell = (
-        ((NB2_REF["cell_vol_A3"] / max(cell_vol_A3, 100.0)) ** 2) * max(scale_i, 1e-12)
-        if getattr(args, "scale_by_cell", False)
-        else 1.0
-    )
+    # Scale-invariant Darwin unit-cell scaling relative to 1AHO (56,230.7 A^3, ~46.4% solvent):
+    # K0_abs(V_cell) / K0_ref_1AHO = (V_cell / V_cell_0) * ((1 - f_solv) / 0.536),
+    # so (V_cell_0 / V_cell)^2 * (K0_abs / K0_ref_1AHO) = (V_cell_0 / V_cell) * ((1 - f_solv) / 0.536),
+    # which is completely independent of the arbitrary units of the input F0 column!
+    if getattr(args, "scale_by_cell", False):
+        f_solv_opt = getattr(args, "solvent_content", None)
+        solv_fac = ((1.0 - float(np.clip(f_solv_opt, 0.05, 0.90))) / 0.536) if f_solv_opt is not None else 1.0
+        gamma_cell = (NB2_REF["cell_vol_A3"] / max(cell_vol_A3, 100.0)) * solv_fac
+    else:
+        gamma_cell = 1.0
 
     # Per-observation Bragg photon gain ratio G / G_0
     gamma_g_obs = max(1e-18, gamma_rate * gamma_wave_bragg * gamma_vol * gamma_cell)
@@ -757,6 +768,55 @@ def compute_exp_background_and_spot_factors(
     return bg_var_mult, spot_width_ratio
 
 
+def compute_sigi_deterministic_terms(
+    s_mag: np.ndarray,
+    u_det: np.ndarray,
+    i_signal: np.ndarray,
+    cal_p: Dict[str, Any],
+    scale_i: float,
+    m_max: int,
+    m_pg_float: np.ndarray,
+    f_ring: np.ndarray,
+    exp_cfg: Optional[Dict[str, Any]] = None,
+    bg_var_mult: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Single shared deterministic SIGIMEAN error model used by both analytical criterion solvers
+    and per-reflection dataset simulation (bit-identical on the default !exp_cfg['active'] path)."""
+    wat_bump = np.exp(-(((s_mag - 0.160) / 0.045) ** 2))
+    cor_bump = np.maximum(0.0, u_det - 0.95) ** 2
+    sig_bg = (float(cal_p["sig0"]) * scale_i) * np.exp(
+        float(cal_p["b1_u2"]) * (u_det * u_det)
+        + float(cal_p["w_wat"]) * wat_bump
+        + float(cal_p.get("b2_cor", 0.0)) * cor_bump
+    )
+    g_shot = float(cal_p["g_shot"]) * scale_i
+    c_sig = float(cal_p["c_sig"])
+
+    if exp_cfg is None or not exp_cfg.get("active", False):
+        mult_factor = np.sqrt(float(m_max) / (m_pg_float * f_ring))
+        mult_factor_pix = mult_factor
+        c_sig_cal = c_sig
+        c_sig_nc = 0.0
+    else:
+        if bg_var_mult is not None:
+            sig_bg = sig_bg * np.sqrt(bg_var_mult)
+        g_shot = g_shot / exp_cfg["gamma_g_obs"]
+        c_sig_cal = c_sig * exp_cfg["f_cal"]
+        c_sig_nc = exp_cfg["sigma_noncal"] / math.sqrt(max(float(m_max), 1.0))
+        c_sig = math.sqrt(c_sig_cal * c_sig_cal + c_sig_nc * c_sig_nc)
+        gw = exp_cfg["gamma_wedge"]
+        gp = exp_cfg["gamma_pix"]
+        raw_obs = gw * m_pg_float * f_ring
+        eff_obs = np.maximum(1.0, raw_obs) if gw < 1.0 else raw_obs
+        raw_pix = gp * m_pg_float * f_ring
+        eff_pix = np.maximum(1.0, raw_pix) if gp < 1.0 else raw_pix
+        mult_factor = np.sqrt(float(m_max) / np.maximum(eff_obs, 0.22))
+        mult_factor_pix = np.sqrt(float(m_max) / np.maximum(eff_pix, 0.22))
+
+    sig_i_det = mult_factor * np.sqrt(sig_bg * sig_bg + g_shot * i_signal + (c_sig * i_signal) ** 2)
+    return sig_i_det, mult_factor, mult_factor_pix, c_sig_cal, c_sig_nc
+
+
 def eval_shell_criterion_metric(
     d_eval: float,
     bw_cand: float,
@@ -786,48 +846,37 @@ def eval_shell_criterion_metric(
         bg_mult_arr, sp_rat_arr = compute_exp_background_and_spot_factors(
             np.array([s_val], dtype=np.float64), bw_cand, b_geom_ref, dist_mm, dist_ref_mm, exp_cfg
         )
-        bg_var_mult = float(bg_mult_arr[0])
         sp_rat = float(sp_rat_arr[0])
         if t_v < 1.0 and abs(sp_rat - 1.0) > 1e-4:
             t_v = max(0.02, t_v ** (sp_rat ** 0.5))
-        g_mult = 1.0 / exp_cfg["gamma_g_obs"]
-        gw = exp_cfg["gamma_wedge"]
-        gp = exp_cfg["gamma_pix"]
-        eff_obs = max(1.0, gw * mean_m_pg * f_ring_v) if gw < 1.0 else (gw * mean_m_pg * f_ring_v)
-        eff_pix = max(1.0, gp * mean_m_pg * f_ring_v) if gp < 1.0 else (gp * mean_m_pg * f_ring_v)
-        mult_fac = math.sqrt(float(m_max) / max(eff_obs, 0.22))
-        mult_fac_pix = math.sqrt(float(m_max) / max(eff_pix, 0.22))
         f_cal = exp_cfg["f_cal"]
-        sig_nc = exp_cfg["sigma_noncal"]
+        gp = exp_cfg["gamma_pix"]
         rad_sys = 0.0025 * exp_cfg["dose_mgy"]
     else:
-        bg_var_mult = 1.0
-        g_mult = 1.0
-        mult_fac = math.sqrt(float(m_max) / max(mean_m_pg * f_ring_v, 0.22))
-        mult_fac_pix = mult_fac
+        bg_mult_arr = None
         f_cal = 1.0
         gp = 1.0
-        sig_nc = 0.0
         rad_sys = 0.0
 
     b_form_cand = bw_cand - (b0_nom_ref - b0_form_ref)
     fp2_r = float(f_prot_sq(np.array(s2_val))) / float(f_prot_sq(np.array(0.0)))
     i_sig = max(1e-30, k0_in * fp2_r * math.exp(-2.0 * b_form_cand * s2_val) * max(t_v, 1e-4))
 
-    wat_b = math.exp(-(((s_val - 0.160) / 0.045) ** 2))
-    cor_b = max(0.0, u_val - 0.95) ** 2
-    sig_bg0 = (float(cal_geom["sig0"]) * scale_i) * math.exp(
-        float(cal_geom["b1_u2"]) * (u_val * u_val)
-        + float(cal_geom["w_wat"]) * wat_b
-        + float(cal_geom.get("b2_cor", 0.0)) * cor_b
+    sig_i_arr, mf_arr, mfp_arr, c_sg_cal, c_sg_nc = compute_sigi_deterministic_terms(
+        np.array([s_val], dtype=np.float64),
+        np.array([u_val], dtype=np.float64),
+        np.array([i_sig], dtype=np.float64),
+        cal_geom,
+        scale_i,
+        m_max,
+        np.array([max(mean_m_pg, 0.22 / max(f_ring_v, 0.22))], dtype=np.float64),
+        np.array([f_ring_v], dtype=np.float64),
+        exp_cfg=exp_cfg,
+        bg_var_mult=bg_mult_arr,
     )
-    sig_bg2 = (sig_bg0 * sig_bg0) * bg_var_mult
-    g_sh = (float(cal_geom["g_shot"]) * scale_i) * g_mult
-    c_sg_cal = float(cal_geom["c_sig"]) * f_cal
-    c_sg_nc = sig_nc / math.sqrt(max(float(m_max), 1.0))
-    c_sg = math.sqrt(c_sg_cal * c_sg_cal + c_sg_nc * c_sg_nc)
-    # Include median log-normal dispersion factor exp(0) = 1
-    sig_i = mult_fac * math.sqrt(max(1e-30, sig_bg2 + g_sh * i_sig + (c_sg * i_sig) ** 2))
+    sig_i = max(float(sig_i_arr[0]), 1e-30)
+    mult_fac = float(mf_arr[0])
+    mult_fac_pix = float(mfp_arr[0])
 
     wk0, wk1, wk2 = hat_weights_3(np.array([u_val]), cal_geom["u_sc_knots"])
     a_st = math.sqrt(
@@ -1149,18 +1198,30 @@ def estimate_shell_sigma_prior(
     if mode == "ccp4":
         s4 = 4.0 * s2
         s4_v = s4[valid]
+        s2_v = s2[valid]
         n_bins = 60
         edges = np.linspace(float(np.min(s4_v)), float(np.max(s4_v)) + 1e-9, n_bins + 1)
         bin_idx = np.clip(np.digitize(s4, edges) - 1, 0, n_bins - 1)
         bin_idx_v = bin_idx[valid]
         ie_v = i_obs[valid] / epsilon[valid]
-        bin_means = np.full(n_bins, np.nan, dtype=np.float64)
+        se_v = sig_i[valid] / epsilon[valid]
+        fp2_0 = float(f_prot_sq(np.array(0.0)))
+        bin_means = np.empty(n_bins, dtype=np.float64)
         for b in range(n_bins):
             m = bin_idx_v == b
             if np.any(m):
                 mn = float(np.mean(ie_v[m]))
                 if mn > 0.0:
                     bin_means[b] = mn
+                    continue
+                s2_b = float(np.mean(s2_v[m]))
+                nf_b = 0.25 * float(np.mean(se_v[m])) / math.sqrt(int(m.sum()))
+            else:
+                s2_b = 0.125 * float(edges[b] + edges[b + 1])
+                nf_b = 1e-6
+            # Positive Wilson / noise-floor fallback when an outer shell's raw mean <I> <= 0 (matching ctruncate)
+            w_b = k0_scaled * (float(f_prot_sq(np.array(s2_b))) / fp2_0) * math.exp(-2.0 * b_form_eff * s2_b)
+            bin_means[b] = max(w_b, nf_b, 1e-6)
         return epsilon * bin_means[bin_idx]
 
     s2_v = s2[valid]
@@ -1393,11 +1454,37 @@ def detect_input_columns(
         is_int = labels[f_col].type in ("J", "K")
         return f_col, f_minus_col, is_int, det_phi
 
+    # 1. Explicit ground-truth columns (anomalous or merged) ALWAYS take priority over observed Fplus/Fminus!
+    for p_cand, m_cand in (("F0(+)", "F0(-)"), ("Fright(+)", "Fright(-)"), ("F_true(+)", "F_true(-)"), ("FC(+)", "FC(-)")):
+        if p_cand in labels and m_cand in labels:
+            return p_cand, m_cand, False, det_phi
+    for cand in ("F0", "Fright", "F_true", "FC", "FC_ALL", "FMODEL", "Fcalc"):
+        if cand in labels and labels[cand].type == "F":
+            return cand, None, False, det_phi
+
+    # 2. Sigma-free anomalous amplitude pairs (e.g. noiseless FrightB0.mtz has F(+), F(-) without SIGF(+))
+    for p_cand, m_cand, s_cand in (
+        ("Fplus", "Fminus", "SIGFplus"),
+        ("F(+)", "F(-)", "SIGF(+)"),
+        ("FP(+)", "FP(-)", "SIGFP(+)"),
+    ):
+        if p_cand in labels and m_cand in labels and s_cand not in labels:
+            return p_cand, m_cand, False, det_phi
+
+    # 3. Explicit ground-truth / sigma-free intensity columns
+    for cand in ("I0", "Iright", "I_true", "IC"):
+        if cand in labels and labels[cand].type == "J":
+            return cand, None, True, det_phi
+    for p_cand, m_cand, s_cand in (("Iplus", "Iminus", "SIGIplus"), ("I(+)", "I(-)", "SIGI(+)")):
+        if p_cand in labels and m_cand in labels and s_cand not in labels:
+            return p_cand, m_cand, True, det_phi
+
+    # 4. Fallback to observed amplitude/intensity columns when no noiseless truth column exists
     for p_cand, m_cand in (("Fplus", "Fminus"), ("F(+)", "F(-)"), ("FP(+)", "FP(-)")):
         if p_cand in labels and m_cand in labels:
             return p_cand, m_cand, False, det_phi
 
-    for cand in ("F0", "Fright", "F", "FP", "FC", "FC_ALL", "FMODEL", "FWT", "Fcalc"):
+    for cand in ("F", "FP", "FWT"):
         if cand in labels and labels[cand].type == "F":
             return cand, None, False, det_phi
     for c in mtz.columns:
@@ -1407,7 +1494,7 @@ def detect_input_columns(
     for p_cand, m_cand in (("Iplus", "Iminus"), ("I(+)", "I(-)")):
         if p_cand in labels and m_cand in labels:
             return p_cand, m_cand, True, det_phi
-    for cand in ("I0", "Iright", "IMEAN", "I", "IOBS"):
+    for cand in ("IMEAN", "I", "IOBS"):
         if cand in labels and labels[cand].type == "J":
             return cand, None, True, det_phi
     for c in mtz.columns:
@@ -1438,10 +1525,26 @@ def simulate_dataset(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Calibration file not found: {cal_path}")
     cal = json.loads(cal_path.read_text(encoding="utf-8"))
 
+    if getattr(args, "apply_xds_b", False) and not args.quiet:
+        print(
+            "WARNING: --apply-xds-b is a deprecated v1 compatibility flag and has no additional effect "
+            "(calibrated T_xds(u) is enabled by default; pass --ideal-transfer to disable it).",
+            file=sys.stderr,
+        )
+
     mtz_in = gemmi.read_mtz_file(str(args.input_mtz))
     col_p, col_m, is_int_in, col_phi = detect_input_columns(
         mtz_in, args.f_col, args.f_minus_col, args.phi_col
     )
+    if args.f_col is None and not args.quiet:
+        lbl_set = {c.label for c in mtz_in.columns}
+        sig_companion = f"SIG{col_p}"
+        if sig_companion in lbl_set:
+            print(
+                f"NOTE: Auto-selected observed column '{col_p}' (which has '{sig_companion}'); "
+                f"pass --f-col explicitly if a different ground-truth column was intended.",
+                file=sys.stderr,
+            )
 
     arr_in = np.array(mtz_in, copy=False)
     h_idx = [mtz_in.column_with_label(lbl).idx for lbl in ("H", "K", "L")]
@@ -1451,9 +1554,20 @@ def simulate_dataset(args: argparse.Namespace) -> int:
     vp = arr_in[:, mtz_in.column_with_label(col_p).idx].astype(np.float64)
     if col_m is not None:
         vm = arr_in[:, mtz_in.column_with_label(col_m).idx].astype(np.float64)
-        valid_in = np.isfinite(vp) & np.isfinite(vm) & (d_all > 0.0)
-        fp0 = np.sqrt(np.maximum(vp[valid_in], 0.0)) if is_int_in else np.maximum(vp[valid_in], 0.0)
-        fm0 = np.sqrt(np.maximum(vm[valid_in], 0.0)) if is_int_in else np.maximum(vm[valid_in], 0.0)
+        ok_vp = np.isfinite(vp)
+        ok_vm = np.isfinite(vm)
+        valid_in = (ok_vp | ok_vm) & (d_all > 0.0)
+        n_single_mate = int(np.sum((ok_vp ^ ok_vm) & (d_all > 0.0)))
+        if n_single_mate > 0 and not args.quiet:
+            print(
+                f"NOTE: {n_single_mate} reflections in ({col_p}, {col_m}) had only one finite mate "
+                f"(e.g. centrics or single-mate observations); filled missing mate from the present mate.",
+                file=sys.stderr,
+            )
+        vp_v = np.where(ok_vp[valid_in], vp[valid_in], vm[valid_in])
+        vm_v = np.where(ok_vm[valid_in], vm[valid_in], vp[valid_in])
+        fp0 = np.sqrt(np.maximum(vp_v, 0.0)) if is_int_in else np.maximum(vp_v, 0.0)
+        fm0 = np.sqrt(np.maximum(vm_v, 0.0)) if is_int_in else np.maximum(vm_v, 0.0)
         f0_mean = np.sqrt(0.5 * (fp0 * fp0 + fm0 * fm0))
         has_anom_in = True
     else:
@@ -1769,43 +1883,25 @@ def simulate_dataset(args: argparse.Namespace) -> int:
             obs_m_wedge = np.where(is_centric, obs_p_wedge, obs_mask & (rng.random(n_ref) < p_mate_ac))
             obs_mask = obs_p_wedge | obs_m_wedge
 
-    # 7. Simulate realistic SIGIMEAN calibrated in the XDS-attenuated intensity frame
-    wat_bump = np.exp(-(((s_mag - 0.160) / 0.045) ** 2))
-    cor_bump = np.maximum(0.0, u_det - 0.95) ** 2
-    sig_bg = (float(cal_p["sig0"]) * scale_i) * np.exp(
-        float(cal_p["b1_u2"]) * (u_det * u_det)
-        + float(cal_p["w_wat"]) * wat_bump
-        + float(cal_p.get("b2_cor", 0.0)) * cor_bump
+    # 7. Simulate realistic SIGIMEAN calibrated in the XDS-attenuated intensity frame (shared model)
+    sig_i_det, mult_factor, mult_factor_pix, c_sig_cal, c_sig_nc = compute_sigi_deterministic_terms(
+        s_mag,
+        u_det,
+        i_xds,
+        cal_p,
+        scale_i,
+        m_max,
+        m_pg.astype(np.float64),
+        f_ring,
+        exp_cfg=exp_cfg,
+        bg_var_mult=bg_var_mult,
     )
-    g_shot = float(cal_p["g_shot"]) * scale_i
-    c_sig = float(cal_p["c_sig"])
-
-    if not exp_cfg["active"]:
-        mult_factor = np.sqrt(float(m_max) / (m_pg.astype(np.float64) * f_ring))
-        mult_factor_pix = mult_factor
-        c_sig_cal = c_sig
-        c_sig_nc = 0.0
-    else:
-        sig_bg = sig_bg * np.sqrt(bg_var_mult)
-        g_shot = g_shot / exp_cfg["gamma_g_obs"]
-        c_sig_cal = c_sig * exp_cfg["f_cal"]
-        c_sig_nc = exp_cfg["sigma_noncal"] / math.sqrt(max(float(m_max), 1.0))
-        c_sig = math.sqrt(c_sig_cal * c_sig_cal + c_sig_nc * c_sig_nc)
-        gw = exp_cfg["gamma_wedge"]
-        gp = exp_cfg["gamma_pix"]
-        raw_obs = gw * m_pg.astype(np.float64) * f_ring
-        eff_obs = np.maximum(1.0, raw_obs) if gw < 1.0 else raw_obs
-        raw_pix = gp * m_pg.astype(np.float64) * f_ring
-        eff_pix = np.maximum(1.0, raw_pix) if gp < 1.0 else raw_pix
-        mult_factor = np.sqrt(float(m_max) / np.maximum(eff_obs, 0.22))
-        mult_factor_pix = np.sqrt(float(m_max) / np.maximum(eff_pix, 0.22))
-
     rms_si = float(cal_p["rms_ln_si"])
     rms_si_cor = float(cal_p.get("rms_ln_si_cor", rms_si))
     w_cor_si = np.clip((u_det - 0.98) / 0.08, 0.0, 1.0)
     rms_si_vec = (1.0 - w_cor_si) * rms_si + w_cor_si * rms_si_cor
     eta_sig = np.clip(rng.normal(0.0, 1.0, size=n_ref) * rms_si_vec, -2.5 * rms_si_vec, 2.5 * rms_si_vec)
-    sig_i_base = mult_factor * np.sqrt(sig_bg * sig_bg + g_shot * i_xds + (c_sig * i_xds) ** 2) * np.exp(eta_sig)
+    sig_i_base = sig_i_det * np.exp(eta_sig)
 
     # 8. Draw noisy intensities and convert to amplitudes
     a_u0 = float(args.a_stat if args.a_stat is not None else cal_p["a_stat"])
@@ -1990,10 +2086,35 @@ def simulate_dataset(args: argparse.Namespace) -> int:
                     isym = np.where(np.isfinite(f_obs), 0.0, np.nan)
 
     # 9. FreeR_flag (0 .. N_bins-1 CCP4 convention, default 0..19)
-    if existing_freer is not None and np.all(np.isfinite(existing_freer)):
-        freer = existing_freer
+    n_bins_free = max(2, int(round(1.0 / max(args.free_fraction, 0.005))))
+    if existing_freer is not None:
+        fin_fr = np.isfinite(existing_freer)
+        if np.all(fin_fr):
+            freer = existing_freer
+        elif np.any(fin_fr):
+            n_miss_fr = int(np.sum(~fin_fr))
+            n_bins_ext = max(n_bins_free, int(np.nanmax(existing_freer[fin_fr])) + 1)
+            fr_rng = np.random.default_rng(args.freer_seed if args.freer_seed is not None else 20260101)
+            freer = existing_freer.copy()
+            freer[~fin_fr] = fr_rng.integers(0, n_bins_ext, size=n_miss_fr).astype(np.float64)
+            if not args.quiet:
+                print(
+                    f"WARNING: Input FreeR_flag had {n_miss_fr}/{n_ref} NaN entries; preserved existing flags "
+                    f"and assigned deterministic FreeR bins (0..{n_bins_ext - 1}) to the missing reflections.",
+                    file=sys.stderr,
+                )
+        else:
+            fr_rng = np.random.default_rng(args.freer_seed) if args.freer_seed is not None else rng
+            freer = fr_rng.integers(0, n_bins_free, size=n_ref).astype(np.float64)
+            if not args.quiet:
+                print(
+                    "WARNING: Input FreeR_flag column contained only NaN values; generated fresh FreeR_flag set.",
+                    file=sys.stderr,
+                )
+    elif args.freer_seed is not None:
+        fr_rng = np.random.default_rng(args.freer_seed)
+        freer = fr_rng.integers(0, n_bins_free, size=n_ref).astype(np.float64)
     else:
-        n_bins_free = max(2, int(round(1.0 / max(args.free_fraction, 0.005))))
         freer = rng.integers(0, n_bins_free, size=n_ref).astype(np.float64)
 
     # 10. Assemble output Gemmi MTZ
@@ -2244,6 +2365,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-true", action="store_true", help="Append pure ground-truth F_true, I_true (and PHI_true if present) columns to output MTZ.")
     p.add_argument("--free-fraction", type=float, default=0.05, help="Fraction for FreeR_flag=0 if input lacks FreeR_flag (default: 0.05).")
     p.add_argument("--regen-freer", action="store_true", help="Regenerate FreeR_flag even if input_mtz already has one.")
+    p.add_argument("--freer-seed", type=int, default=None, help="Dedicated seed for FreeR_flag generation so R-free flags stay fixed when varying --seed.")
     p.add_argument(
         "--truncate-mode",
         choices=["xdsconv", "ccp4", "smooth"],
@@ -2284,8 +2406,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     eg.add_argument("--spindle-vel-err", type=float, default=None, help="Spindle angular velocity fractional ripple d(omega)/omega (default: 0.0).")
     eg.add_argument("--dose-mgy", type=float, default=None, help="Absorbed X-ray dose in MGy (adds global B growth and non-isomorphism; default: 0.0).")
     eg.add_argument("--auto-dose", action="store_true", help="Estimate absorbed dose (MGy) automatically from incident photon fluence and wavelength.")
-    eg.add_argument("--rad-b-per-mgy", type=float, default=0.70, help="Wedge-averaged global Wilson B increase per MGy of dose (default: 0.70 A^2/MGy).")
-    eg.add_argument("--scale-by-cell", action="store_true", help="Apply physical Darwin unit-cell volume & scattering density scaling relative to 1AHO (56,231 A^3).")
+    eg.add_argument("--rad-b-per-mgy", type=float, default=None, help="Wedge-averaged global Wilson B increase per MGy of dose (default: 0.70 A^2/MGy when --dose-mgy or --auto-dose is active).")
+    eg.add_argument("--scale-by-cell", action="store_true", help="Apply scale-invariant Darwin unit-cell volume scaling relative to 1AHO (56,231 A^3).")
 
     ig = p.add_argument_group(
         "Inverse forensic deduction mode (deduce experimental parameters from observed F,SIGF / I,SIGI)"

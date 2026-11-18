@@ -2,7 +2,7 @@
 
 Fast, standalone Python toolkit (`numpy` + `gemmi` only) for **both directions** of macromolecular X-ray diffraction error modeling:
 
-1. **Forward Simulation (`sim_reso_mtz.py` / `sim-reso-mtz`):** Generates realistic merged structure-factor & intensity MTZ datasets (`IMEAN`, `SIGIMEAN`, `I(+)`, `SIGI(+)`, `I(-)`, `SIGI(-)`, `F`, `SIGF`, `DANO`, `SIGDANO`, `ISYM`) from ground-truth amplitudes `F0` and a target resolution limit `d_min` (or physical beam/crystal/background/dose parameters) in **~0.2 s**, calibrated against `575` pixel-level `nanoBragg` + `nonBragg` + `XDS` + `XDSCONV` simulations (`18.2–518.2 Å²` Wilson $B$) and validated out-of-sample on `574` held-out datasets.
+1. **Forward Simulation (`sim_reso_mtz.py` / `sim-reso-mtz`):** Generates realistic merged structure-factor & intensity MTZ datasets (`FreeR_flag`, `F`, `SIGF`, `DANO`, `SIGDANO`, `ISYM`, `Fplus`, `SIGFplus`, `Fminus`, `SIGFminus`, `IMEAN`, `SIGIMEAN`, `Iplus`, `SIGIplus`, `Iminus`, `SIGIminus`) from ground-truth amplitudes `F0` and a target resolution limit `d_min` (or physical beam/crystal/background/dose parameters) in **~0.2 s**, calibrated against `575` pixel-level `nanoBragg` + `nonBragg` + `XDS` + `XDSCONV` simulations (`18.2–518.2 Å²` Wilson $B$) and validated out-of-sample on `574` held-out datasets.
 2. **Blind Inverse Deduction (`--deduce` / `deduce_mtz_params.py` / `deduce-mtz-params`):** Given **only** `(H, K, L, F, SIGF)` (or `IMEAN, SIGIMEAN`) from any `.mtz` or SF-mmCIF (`.cif` / `.ent`) — without reading PDB headers or papers — reconstructs the $I \to F$ truncation software & cutoff, absolute electron scale, Debye–Babinet Wilson $B$, square-detector corner $d_{\text{edge}}$ vs spherical cutoff, multi-pass / multi-crystal merge discontinuities, spindle Lorentz blind cone, 16-bit low-angle overload saturation, diffuse background mount regime (`RT silica capillary` vs `100 K cryo water` vs `ice rings`), anomalous `weirdsigma` error models, universal Darwin photon-budget invariant ($\Phi_{\text{tot}} V_{\text{illum}} \lambda^3 \cdot \text{DQE}$), wavelength & radiation-damage crystal-size bounds, and an executable forward replay command in **~0.3–0.8 s**.
 
 ---
@@ -84,7 +84,7 @@ Running `--deduce` strictly on `(H, K, L, F, SIGF)` without reading PDB headers 
 - **First-Principles Experimental Scaling:** Scales Bragg photons ($\propto \Phi_{\text{tot}} V_{\text{illum}} \lambda^3 / V_{\text{cell}}^2$) against exact `nonBragg` diffuse scattering (`water.stol`, `air.stol`, and `incoherent.stol` Compton + $B$-diffuse profiles), separating pixel-locked flat-field error (`--calib-err`, which repeats on the same detector pixels across multi-turn sweeps unless `--n-det-pos > 1`) from non-repeating mechanical errors (`--beam-flicker`, `--shutter-jitter-ms`, `--sample-vib-um`, `--spindle-wobble-um`).
 
 ### 4.2 Inverse Solver (`deduce_mtz_params.py`)
-- **Exact French–Wilson Inversion & Bias-Free Regressor:** Reconstructs pre-truncation $\hat{\sigma}_I = \frac{F \cdot \text{SIGF}}{\mu_y(z)\sigma_y(z)}$ smoothly from high SNR ($\mu_y\sigma_y \to \frac{1}{2}$) down to $z = -12$, and uses the exact Bayesian posterior expectation $I_{\text{post}} = \mathbb{E}[I_{\text{true}} \mid I_{\text{obs}}, \sigma_I, \Sigma] = F^2 + \gamma\sigma_F^2$ in a joint 2D `(shell × intensity-octile)` active-set NNLS fit $\sigma_{I,\text{ref}}^2 = \sigma_{\text{bg}}^2(d) + g_{\text{shot}} I + c_{\text{merged}}^2 I^2$.
+- **Exact French–Wilson Inversion & Bias-Free Regressor:** Reconstructs pre-truncation $\hat{\sigma}_I = \frac{F \cdot \text{SIGF}}{\mu_y(z)\sigma_y(z)}$ smoothly from high SNR ($\mu_y\sigma_y \to \frac{1}{2}$) down to $z = -20$, and uses the exact Bayesian posterior expectation $I_{\text{post}} = \mathbb{E}[I_{\text{true}} \mid I_{\text{obs}}, \sigma_I, \Sigma] = F^2 + \gamma\sigma_F^2$ in a joint 2D `(shell × intensity-octile)` active-set NNLS fit $\sigma_{I,\text{ref}}^2 = \sigma_{\text{bg}}^2(d) + g_{\text{shot}} I + c_{\text{merged}}^2 I^2$.
 - **Universal Wedge-Independent Darwin Invariant:** Because single-pass photon gain scales as $1/\Delta\phi$ while multiplicity scales as $\Delta\phi$, total rotation wedge $\Delta\phi$ cancels out of merged $g_{\text{shot}}$, pinning $\Phi_{\text{tot}} V_{\text{illum}} \lambda^3 \cdot \text{DQE} = \frac{2\pi V_{\text{cell}}^2}{M_{\max} r_e^2 \langle LP \rangle g_{\text{shot}}}$ directly from `(H, K, L, F, SIGF)`.
 
 ---
@@ -113,6 +113,6 @@ Evaluated strictly out-of-sample on held-out seeds `.06–.10` (`574` Pilatus 6M
 - `deduce_mtz_params.py` — Blind inverse experimental & processing forensics CLI & Python API.
 - `nanobragg2_calibration.json` — 115-point empirical calibration table (`B_Wilson = 18.2–518.2 Å²`).
 - `build_calibration_v2.py` — Reproducible calibration extractor from raw `nanoBragg2` `FreeRed.mtz` runs.
-- `pyproject.toml` — Standard PEP 621 package metadata & CLI entry points (`sim-reso-mtz`, `deduce-mtz-params`).
+- `pyproject.toml` & `setup.py` — PEP 621 package metadata, wheel data packaging (`nanobragg2_calibration.json`), and CLI entry points (`sim-reso-mtz`, `deduce-mtz-params`).
 - `LICENSE` — MIT License.
 
