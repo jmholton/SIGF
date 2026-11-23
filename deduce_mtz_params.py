@@ -532,7 +532,60 @@ def analyze_amplitude_conversion_and_detruncate(
     info: Dict[str, Any] = {
         "has_F_columns": bool(has_f),
         "has_I_columns": bool(has_i),
+        "mislabeled_amplitudes_in_intensity_column": False,
     }
+
+    # Detect mislabeled structure-factor amplitudes (F, SIGF) deposited inside intensity columns (I, SIGI),
+    # e.g. 2V6F-sf.cif: strictly non-negative values + Rayleigh acentric second-moment <X^2>/<X>^2 ~ 4/pi = 1.273
+    # (vs >= 1.50 even for perfectly twinned intensities, and 2.00 for untwinned Wilson intensities).
+    mislabeled_f_note: Optional[str] = None
+    if has_i and not has_f:
+        assert i_obs is not None and sig_i is not None
+        vi_chk = np.isfinite(i_obs) & np.isfinite(sig_i) & (sig_i > 0.0)
+        if int(np.sum(vi_chk)) >= 150 and bool(np.all(i_obs[vi_chk] >= 0.0)):
+            m_ac_m = vi_chk & (~is_centric) & (s2 >= 0.004) & (i_obs > 0.0)
+            if int(np.sum(m_ac_m)) < 100:
+                m_ac_m = vi_chk & (~is_centric) & (i_obs > 0.0)
+            mom_med = float("nan")
+            if int(np.sum(m_ac_m)) >= 80:
+                ord_m = np.argsort(s2[m_ac_m])
+                xm = (i_obs[m_ac_m] / np.maximum(epsilon[m_ac_m], 1.0))[ord_m]
+                n_sh_m = min(12, max(3, len(xm) // 80))
+                sh_moms = [
+                    float(np.mean(ch * ch) / max(float(np.mean(ch)) ** 2, 1e-30))
+                    for ch in np.array_split(xm, n_sh_m)
+                    if len(ch) >= 15
+                ]
+                if sh_moms:
+                    mom_med = float(np.median(sh_moms))
+            snr_chk = i_obs[vi_chk] / sig_i[vi_chk]
+            ac_chk = snr_chk[~is_centric[vi_chk]]
+            cen_chk = snr_chk[is_centric[vi_chk]]
+            min_ac_i = float(np.min(ac_chk)) if len(ac_chk) > 0 else float("nan")
+            min_cen_i = float(np.min(cen_chk)) if len(cen_chk) >= 15 else float("nan")
+            fw_floor_split = (
+                np.isfinite(min_ac_i)
+                and np.isfinite(min_cen_i)
+                and 1.75 <= min_ac_i <= 2.45
+                and 1.20 <= min_cen_i <= 1.70
+                and (min_ac_i - min_cen_i) >= 0.35
+            )
+            if (np.isfinite(mom_med) and mom_med < 1.42) or fw_floor_split:
+                info["mislabeled_amplitudes_in_intensity_column"] = True
+                if np.isfinite(mom_med):
+                    info["acentric_second_moment_ratio"] = round(mom_med, 4)
+                mislabeled_f_note = (
+                    f"MISLABELED AMPLITUDES IN INTENSITY COLUMN "
+                    f"(0 negative values, acentric <X^2>/<X>^2 = {mom_med:.3f} ~ 4/pi) -> "
+                    if np.isfinite(mom_med)
+                    else "MISLABELED AMPLITUDES IN INTENSITY COLUMN (0 negative values, French-Wilson F/SIGF floor) -> "
+                )
+                f_obs = i_obs
+                sig_f = sig_i
+                has_f = True
+                has_i = False
+                info["has_F_columns"] = True
+                info["has_I_columns"] = False
 
     if has_f:
         assert f_obs is not None and sig_f is not None
@@ -626,6 +679,8 @@ def analyze_amplitude_conversion_and_detruncate(
                     inferred_min_isigi = round(min(2.0, z_est + 0.25), 2)
                     software_label = f"Merged French-Wilson (TRUNCATE/ctruncate-like; J_eff_min = {z_est:+.2f})"
 
+        if mislabeled_f_note is not None:
+            software_label = mislabeled_f_note + software_label
         info["software"] = software_label
         info["truncate_mode"] = inferred_mode
         info["inferred_min_isigi"] = inferred_min_isigi
@@ -657,8 +712,24 @@ def analyze_amplitude_conversion_and_detruncate(
         if has_f:
             assert f_obs is not None and sig_f is not None
             vf_i = vi & np.isfinite(f_obs) & np.isfinite(sig_f)
+            # Deposited F_meas_au^2 and intensity_meas in SF-mmCIF files frequently carry independent
+            # arbitrary scale factors (e.g. F^2 / I = 100..3300); place i_post onto the exact I scale!
+            m_sc = vf_i & (i_obs > 3.0 * sig_i) & (f_obs > 0.0)
+            if int(np.sum(m_sc)) < 20:
+                m_sc = vf_i & (i_obs > 0.0) & (f_obs > 0.0)
+            if np.any(m_sc):
+                scale_i_over_f2 = float(np.median(i_obs[m_sc] / np.maximum(f_obs[m_sc] * f_obs[m_sc], 1e-30)))
+                if abs(scale_i_over_f2 - 1.0) < 0.02:
+                    scale_i_over_f2 = 1.0
+            else:
+                scale_i_over_f2 = 1.0
+            info["f2_over_i_scale_ratio"] = round(1.0 / max(scale_i_over_f2, 1e-30), 6)
             mult_fvar = np.where((~is_centric) & (info.get("truncate_mode") == "xdsconv"), 2.0, 1.0)
-            i_post = np.where(vf_i, f_obs * f_obs + mult_fvar * (sig_f * sig_f), np.maximum(i_obs, 0.25 * sig_i))
+            i_post = np.where(
+                vf_i,
+                (f_obs * f_obs + mult_fvar * (sig_f * sig_f)) * scale_i_over_f2,
+                np.maximum(i_obs, 0.25 * sig_i),
+            )
         else:
             i_post = np.maximum(i_obs, 0.25 * sig_i)
         return {
@@ -758,7 +829,11 @@ def analyze_amplitude_conversion_and_detruncate(
         "i_hat": i_hat,
         "sig_i_hat": sig_i_hat,
         "i_post": i_post,
-        "sigma_source": "French-Wilson_inverted_SIGF",
+        "sigma_source": (
+            "mislabeled_I_as_F_French_Wilson"
+            if info.get("mislabeled_amplitudes_in_intensity_column")
+            else "French-Wilson_inverted_SIGF"
+        ),
     }
 
 
@@ -955,7 +1030,8 @@ def detect_geometry_and_pass_boundaries(
     changepoints: List[Dict[str, Any]] = []
     if n_g >= 400:
         s_lo_valid = float(s_g[min(75, n_g - 1)])
-        s_hi_valid = float(s_g[max(0, n_g - 76)])
+        hi_margin = max(76, int(0.015 * n_g))
+        s_hi_valid = float(s_g[max(0, n_g - hi_margin)])
         if s_hi_valid > s_lo_valid + 0.03:
             # Log-spaced 1/d grid gives equal fractional resolution density (dd/d) from low-res (4 A) to atomic-res (0.9 A)
             cand_s = np.geomspace(max(s_lo_valid, 0.04), s_hi_valid, 280)
@@ -1705,7 +1781,7 @@ def deduce_physical_parameters_and_replay(
     est_air_mm: Optional[float] = None
     sh_s = np.asarray(var_info["global"]["shells_s"], dtype=np.float64)
     sh_bg = np.asarray(var_info["global"]["shells_bg_e2"], dtype=np.float64)
-    if len(sh_s) >= 4 and not geom_info["pass_boundaries"]:
+    if len(sh_s) >= 4:
         u_sh = (d_edg_obs if geom_info["cutoff_type"] == "detector_corners" else d_edg_ref) * (2.0 * sh_s)
         wat_b = np.exp(-(((sh_s - 0.160) / 0.045) ** 2))
         cor_b = np.maximum(0.0, u_sh - 0.95) ** 2
@@ -1733,6 +1809,12 @@ def deduce_physical_parameters_and_replay(
         )
         lhs = bg_var_mult_obs * (gamma_g_obs_inferred ** 2) * tot0 - s_xtl_est
         m_fit = u_sh <= 0.96
+        if geom_info["pass_boundaries"]:
+            s_cut_pass = 0.5 / max(float(geom_info["pass_boundaries"][0]["d_A"]), 0.25)
+            if int(np.sum(m_fit & (sh_s < s_cut_pass))) >= 3:
+                m_fit = m_fit & (sh_s < s_cut_pass)
+            else:
+                m_fit = np.zeros_like(m_fit, dtype=bool)
         if np.sum(m_fit) >= 3:
             col_air = (a_beam_est * 1000.0) * (1.2e-3 / 28.0) * f_air2[m_fit]
             col_wat = a_beam_est * (1.0 / 18.0) * f_wat2[m_fit]
@@ -1941,8 +2023,11 @@ def audit_sdfac_against_reference(
 
         r_f_sh = float("nan")
         if f_obs is not None and np.any(np.isfinite(f_obs[mz])):
-            mf = mz & np.isfinite(f_obs)
-            r_f_sh = float(np.sum(np.abs(f_obs[mf] - fc_scaled[mf])) / max(float(np.sum(fc_scaled[mf])), 1e-12))
+            mf = mz & np.isfinite(f_obs) & np.isfinite(fc_scaled)
+            sum_fc = float(np.sum(fc_scaled[mf]))
+            if sum_fc > 1e-12:
+                k_rf = float(np.sum(f_obs[mf])) / sum_fc
+                r_f_sh = float(np.sum(np.abs(f_obs[mf] - k_rf * fc_scaled[mf])) / max(float(np.sum(f_obs[mf])), 1e-12))
 
         return {
             "n": int(np.sum(mz)),
@@ -2114,14 +2199,17 @@ def deduce_dataset_parameters(
     )
 
     sdfac_audit: Dict[str, Any] = {"available": False}
+    is_mislab = bool(conv["info"].get("mislabeled_amplitudes_in_intensity_column"))
+    f_for_aud = f_arr if f_arr is not None else (i_arr if is_mislab else None)
+    sf_for_aud = sf_arr if sf_arr is not None else (si_arr if is_mislab else None)
     if fc_arr is not None:
         sdfac_audit = audit_sdfac_against_reference(
             cell,
             hkls[val],
             d[val],
             s2[val],
-            f_arr[val] if f_arr is not None else None,
-            sf_arr[val] if sf_arr is not None else None,
+            f_for_aud[val] if f_for_aud is not None else None,
+            sf_for_aud[val] if sf_for_aud is not None else None,
             conv["i_hat"][val],
             conv["sig_i_hat"][val],
             fc_arr[val],
@@ -2135,8 +2223,8 @@ def deduce_dataset_parameters(
             hkls[val],
             d[val],
             s2[val],
-            f_arr[val] if f_arr is not None else None,
-            sf_arr[val] if sf_arr is not None else None,
+            f_for_aud[val] if f_for_aud is not None else None,
+            sf_for_aud[val] if sf_for_aud is not None else None,
             conv["i_hat"][val],
             conv["sig_i_hat"][val],
             fc_mod,
@@ -2206,7 +2294,7 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
             f"  F/SIGF floor      : acentric min = {ac['min_fsigf_acentric']:.4f} (p0.5% = {ac['p05_fsigf_acentric']:.3f}), "
             f"centric min = {ac['min_fsigf_centric']:.4f} (n_cen = {ac['n_centric_F']})"
         )
-    if ac.get("has_I_columns"):
+    if ac.get("has_I_columns") and "min_isigi_direct" in ac:
         lines.append(f"  Direct I/SIGI min : {ac['min_isigi_direct']:+.3f} sigma (untruncated IMEAN extremum)")
 
     cc_note = (
