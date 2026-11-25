@@ -1152,32 +1152,38 @@ def detect_geometry_and_pass_boundaries(
                     spindle_info["detected"] = True
                     spindle_info["axis"] = f"{real_ax}-axis ({worst_ax[0]} blind cone: {100*worst_ax[1]['completeness']:.1f}% vs {100*other_med:.1f}% orthogonal)"
 
-    # 3. Low-angle detector saturation / overload check (away from blind cone & beamstop)
+    # 3. Low-angle detector saturation / overload check (away from blind cone, beamstop, & outer cutoff!)
     overload_info: Dict[str, Any] = {"detected": False}
     if has_lattice:
-        m_low_asu = (asu_d >= 3.2) & (asu_d <= min(d_max_obs * 0.92, 12.0))
-        if spindle_info["detected"] and spindle_info["axis"]:
-            ax_idx = {"a": 0, "b": 1, "c": 2}[spindle_info["axis"][0]]
-            orth_frac = reciprocal_cartesian_matrix(cell)
-            sc_l = asu_hkls[m_low_asu] @ orth_frac.T
-            sc_ln = sc_l / np.maximum(np.linalg.norm(sc_l, axis=1, keepdims=True), 1e-12)
-            v_sp = orth_frac[:, ax_idx] / max(float(np.linalg.norm(orth_frac[:, ax_idx])), 1e-12)
-            not_cone = np.abs(sc_ln @ v_sp) <= 0.82
-            n_low_tot = int(np.sum(not_cone))
-            n_low_miss = int(np.sum(~asu_present[m_low_asu][not_cone]))
-        else:
-            n_low_tot = int(np.sum(m_low_asu))
-            n_low_miss = int(np.sum(~asu_present[m_low_asu]))
+        d_core_lim = max(
+            d_min_obs,
+            inferred_d_edge if cutoff_type in ("detector_corners", "ellipsoidal_anisotropic") else d_min_obs,
+        )
+        if d_core_lim <= 2.6:
+            m_low_asu = (asu_d >= 3.2) & (asu_d <= min(d_max_obs * 0.92, 12.0))
+            if spindle_info["detected"] and spindle_info["axis"]:
+                ax_idx = {"a": 0, "b": 1, "c": 2}[spindle_info["axis"][0]]
+                orth_frac = reciprocal_cartesian_matrix(cell)
+                sc_l = asu_hkls[m_low_asu] @ orth_frac.T
+                sc_ln = sc_l / np.maximum(np.linalg.norm(sc_l, axis=1, keepdims=True), 1e-12)
+                v_sp = orth_frac[:, ax_idx] / max(float(np.linalg.norm(orth_frac[:, ax_idx])), 1e-12)
+                not_cone = np.abs(sc_ln @ v_sp) <= 0.82
+                n_low_tot = int(np.sum(not_cone))
+                n_low_miss = int(np.sum(~asu_present[m_low_asu][not_cone]))
+            else:
+                n_low_tot = int(np.sum(m_low_asu))
+                n_low_miss = int(np.sum(~asu_present[m_low_asu]))
 
-        m_mid_asu = (asu_d >= 2.0) & (asu_d < 3.0)
-        mid_miss_rate = float(np.mean(~asu_present[m_mid_asu])) if np.sum(m_mid_asu) >= 50 else 0.0
-        low_miss_rate = n_low_miss / max(n_low_tot, 1)
-        overload_info = {
-            "detected": bool(n_low_tot >= 60 and n_low_miss >= 6 and low_miss_rate > max(0.018, 2.5 * mid_miss_rate)),
-            "n_missing_low_angle_noncone": n_low_miss,
-            "n_possible_low_angle_noncone": n_low_tot,
-            "low_angle_missing_pct": round(100.0 * low_miss_rate, 2),
-        }
+            m_mid_asu = (asu_d >= 2.0) & (asu_d < 3.0)
+            has_mid_ref = int(np.sum(m_mid_asu)) >= 50
+            mid_miss_rate = float(np.mean(~asu_present[m_mid_asu])) if has_mid_ref else 1.0
+            low_miss_rate = n_low_miss / max(n_low_tot, 1)
+            overload_info = {
+                "detected": bool(has_mid_ref and n_low_tot >= 60 and n_low_miss >= 6 and low_miss_rate > max(0.018, 2.5 * mid_miss_rate)),
+                "n_missing_low_angle_noncone": n_low_miss,
+                "n_possible_low_angle_noncone": n_low_tot,
+                "low_angle_missing_pct": round(100.0 * low_miss_rate, 2),
+            }
 
     # 4. Rank-Adaptive Blind Multi-Pass / Multi-Crystal Merge Boundary Scanner
     # Sorting by 1/d and using an adaptive local rank window [k - W, k + W] catches pass boundaries
@@ -1411,9 +1417,10 @@ def estimate_absolute_electron_wilson(
             continue
         s2_m = float(np.mean(s2_v[m]))
         d_m = 0.5 / math.sqrt(max(s2_m, 1e-12))
-        if has_sig_v:
-            cc12_m = compute_cc12_from_sigi(ih_v[m], sh_v[m])
-            isig_m = float(np.nanmean(ih_v[m] / sh_v[m]))
+        m_sp = m & np.isfinite(sh_v) & (sh_v > 0.0)
+        if int(np.sum(m_sp)) >= 4:
+            cc12_m = compute_cc12_from_sigi(ih_v[m_sp], sh_v[m_sp])
+            isig_m = float(np.mean(ih_v[m_sp] / sh_v[m_sp]))
         else:
             cc12_m = float("nan")
             isig_m = 5.0
@@ -2636,7 +2643,12 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
         if assump.get("scale_is_assumed", False)
         else ""
     )
-    cu_str = " [1.54 A Cu K-alpha RULED OUT -> synchrotron/Mo]" if wb["cu_kalpha_1p54A_ruled_out"] else ""
+    if wb["physical_backscatter_max_2th180"] < 1.535:
+        cu_str = " [1.54 A Cu K-alpha PHYSICALLY IMPOSSIBLE at any 2th -> synchrotron/Mo]"
+    elif wb["cu_kalpha_1p54A_ruled_out"]:
+        cu_str = " [un-swung 2th<=65d Cu K-alpha ruled out -> synchrotron/Mo or high-2th swing arm]"
+    else:
+        cu_str = ""
     hdr_wl = f" (file header wavelength = {fm['header_wavelength_A_not_used_in_blind_fit']:.4f} A, unused)" if fm["header_wavelength_A_not_used_in_blind_fit"] else ""
     lines.append("")
     lines.append("5. Deduceable Physical Invariants, Inequalities & nanoBragg2-Equivalent Setup:")
