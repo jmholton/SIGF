@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigf"
-version = "2.4.2"
+version = "2.4.3"
 description = "Bi-directional macromolecular diffraction MTZ/mmCIF simulator (F0 -> F, SIGF) and blind inverse experimental parameter solver (F, SIGF -> beamline, crystal, mount, & processing forensics)."
 readme = "README.md"
 license = { file = "LICENSE" }

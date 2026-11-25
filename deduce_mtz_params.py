@@ -173,6 +173,56 @@ def exact_nnls(a_mat: np.ndarray, b_vec: np.ndarray) -> np.ndarray:
     return x
 
 
+def _merge_friedel_pair(
+    vp: np.ndarray,
+    sp: np.ndarray,
+    vm: np.ndarray,
+    sm: np.ndarray,
+    spacegroup: gemmi.SpaceGroup,
+    hkls: np.ndarray,
+    is_intensity: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Merge Friedel mates (F+/F- or I+/I-) into mean amplitude or intensity when merged columns are absent."""
+    ops = spacegroup.operations()
+    is_cen = np.fromiter((ops.is_reflection_centric(h) for h in hkls.tolist()), dtype=bool, count=len(hkls))
+    ok_p = np.isfinite(vp) & np.isfinite(sp) & (sp > 0.0)
+    ok_m = np.isfinite(vm) & np.isfinite(sm) & (sm > 0.0)
+    both = ok_p & ok_m
+    out_v = np.full(len(vp), np.nan, dtype=np.float64)
+    out_s = np.full(len(vp), np.nan, dtype=np.float64)
+
+    only_p = ok_p & (~ok_m)
+    only_m = ok_m & (~ok_p)
+    out_v[only_p] = vp[only_p]
+    out_s[only_p] = sp[only_p]
+    out_v[only_m] = vm[only_m]
+    out_s[only_m] = sm[only_m]
+
+    if np.any(both):
+        # On centrics where F+ == F- is duplicated in both columns, keep single-observation sigma!
+        dup_cen = both & is_cen & (np.abs(vp - vm) <= 1e-4 * (np.abs(vp) + 1.0))
+        out_v[dup_cen] = vp[dup_cen]
+        out_s[dup_cen] = sp[dup_cen]
+        ind_both = both & (~dup_cen)
+        if np.any(ind_both):
+            if is_intensity:
+                wp = 1.0 / np.maximum(sp[ind_both] * sp[ind_both], 1e-30)
+                wm = 1.0 / np.maximum(sm[ind_both] * sm[ind_both], 1e-30)
+                out_v[ind_both] = (wp * vp[ind_both] + wm * vm[ind_both]) / (wp + wm)
+                out_s[ind_both] = 1.0 / np.sqrt(wp + wm)
+            else:
+                out_v[ind_both] = 0.5 * (vp[ind_both] + vm[ind_both])
+                out_s[ind_both] = 0.5 * np.sqrt(sp[ind_both] * sp[ind_both] + sm[ind_both] * sm[ind_both])
+
+    # Also preserve zero-sigma legacy values if both sigmas are 0/NaN
+    if not np.any(np.isfinite(out_v)):
+        ok_vp0 = np.isfinite(vp)
+        ok_vm0 = np.isfinite(vm)
+        out_v = np.where(ok_vp0 & ok_vm0, 0.5 * (vp + vm), np.where(ok_vp0, vp, np.where(ok_vm0, vm, np.nan)))
+        out_s = np.zeros_like(out_v)
+    return out_v, out_s
+
+
 # ==============================================================================
 # 2. Universal Reflection File Reader (MTZ & SF-mmCIF)
 # ==============================================================================
@@ -278,6 +328,31 @@ def load_reflection_file(
         wls = [float(ds.wavelength) for ds in mtz.datasets if float(ds.wavelength) > 0.0]
         header_wl = wls[-1] if wls else None
 
+        f_mtz = _get_col(det_f)
+        sf_mtz = _get_col(det_sf)
+        i_mtz = _get_col(det_i)
+        si_mtz = _get_col(det_si)
+
+        if f_mtz is None and det_fp is not None:
+            f_mtz, sf_mtz = _merge_friedel_pair(
+                _get_col(det_fp), _get_col(det_sfp), _get_col(det_fm), _get_col(det_sfm),
+                mtz.spacegroup, hkls, is_intensity=False,
+            )
+            det_f, det_sf = f"{det_fp}/{det_fm}", f"{det_sfp}/{det_sfm}"
+
+        if not f_only and i_mtz is None:
+            for ip_l, sip_l, im_l, sim_l in (
+                ("Iplus", "SIGIplus", "Iminus", "SIGIminus"),
+                ("I(+)", "SIGI(+)", "I(-)", "SIGI(-)"),
+            ):
+                if all(k in labels for k in (ip_l, sip_l, im_l, sim_l)):
+                    i_mtz, si_mtz = _merge_friedel_pair(
+                        _get_col(ip_l), _get_col(sip_l), _get_col(im_l), _get_col(sim_l),
+                        mtz.spacegroup, hkls, is_intensity=True,
+                    )
+                    det_i, det_si = f"{ip_l}/{im_l}", f"{sip_l}/{sim_l}"
+                    break
+
         return {
             "path": str(p),
             "format": "MTZ",
@@ -291,10 +366,10 @@ def load_reflection_file(
             "sigf_col": det_sf,
             "i_col": det_i,
             "sigi_col": det_si,
-            "F": _get_col(det_f),
-            "SIGF": _get_col(det_sf),
-            "I": _get_col(det_i),
-            "SIGI": _get_col(det_si),
+            "F": f_mtz,
+            "SIGF": sf_mtz,
+            "I": i_mtz,
+            "SIGI": si_mtz,
             "ISYM": _get_col(det_isym),
             "DANO": _get_col(det_dano),
             "SIGDANO": _get_col(det_sdano),
@@ -378,6 +453,30 @@ def load_reflection_file(
             if sigi_col
             else _cif_arr(("intensity_sigma", "I_meas_sigma", "SIGIMEAN"))
         )
+    det_fp_c, fp_c = _cif_arr(("pdbx_F_plus", "F_plus"))
+    det_sfp_c, sfp_c = _cif_arr(("pdbx_F_plus_sigma", "F_plus_sigma"))
+    det_fm_c, fm_c = _cif_arr(("pdbx_F_minus", "F_minus"))
+    det_sfm_c, sfm_c = _cif_arr(("pdbx_F_minus_sigma", "F_minus_sigma"))
+
+    if f_vals is None and fp_c is not None and fm_c is not None and sfp_c is not None and sfm_c is not None:
+        f_vals, sf_vals = _merge_friedel_pair(
+            fp_c, sfp_c, fm_c, sfm_c, cif_sg, hkls, is_intensity=False
+        )
+        det_f = f"{det_fp_c}/{det_fm_c}"
+        det_sf = f"{det_sfp_c}/{det_sfm_c}"
+
+    if not f_only and i_vals is None:
+        det_ip_c, ip_c = _cif_arr(("pdbx_I_plus", "I_plus"))
+        det_sip_c, sip_c = _cif_arr(("pdbx_I_plus_sigma", "I_plus_sigma"))
+        det_im_c, im_c = _cif_arr(("pdbx_I_minus", "I_minus"))
+        det_sim_c, sim_c = _cif_arr(("pdbx_I_minus_sigma", "I_minus_sigma"))
+        if ip_c is not None and im_c is not None and sip_c is not None and sim_c is not None:
+            i_vals, si_vals = _merge_friedel_pair(
+                ip_c, sip_c, im_c, sim_c, cif_sg, hkls, is_intensity=True
+            )
+            det_i = f"{det_ip_c}/{det_im_c}"
+            det_si = f"{det_sip_c}/{det_sim_c}"
+
     fc_vals = np.asarray(rb.make_float_array(fc_col), dtype=np.float64) if fc_col else None
     header_wl = float(rb.wavelength) if rb.wavelength > 0.0 else None
 
@@ -401,10 +500,10 @@ def load_reflection_file(
         "ISYM": None,
         "DANO": None,
         "SIGDANO": None,
-        "Fplus": None,
-        "SIGFplus": None,
-        "Fminus": None,
-        "SIGFminus": None,
+        "Fplus": fp_c,
+        "SIGFplus": sfp_c,
+        "Fminus": fm_c,
+        "SIGFminus": sfm_c,
         "FC": fc_vals,
         "fc_col": fc_col,
     }
@@ -527,6 +626,36 @@ def analyze_amplitude_conversion_and_detruncate(
     has_f = f_obs is not None and sig_f is not None and np.any(np.isfinite(f_obs) & (sig_f > 0))
     has_i = i_obs is not None and sig_i is not None and np.any(np.isfinite(i_obs) & (sig_i > 0))
     if not has_f and not has_i:
+        # Support legacy 1970s-1990s sigma-less PDB depositions (e.g. 101M: F_meas_sigma_au = 0.000 everywhere):
+        # still deduce completeness, cutoff geometry, blind cone, overloads, Wilson B_form, and wavelength bounds!
+        vf_nosig = (f_obs is not None) and np.any(np.isfinite(f_obs) & (f_obs > 0.0))
+        vi_nosig = (i_obs is not None) and np.any(np.isfinite(i_obs))
+        if vf_nosig or vi_nosig:
+            if vf_nosig:
+                assert f_obs is not None
+                v_ns = np.isfinite(f_obs) & (f_obs > 0.0)
+                ip_ns = np.where(v_ns, f_obs * f_obs, np.nan)
+            else:
+                assert i_obs is not None
+                v_ns = np.isfinite(i_obs)
+                ip_ns = np.where(v_ns, np.maximum(i_obs, 0.0), np.nan)
+            return {
+                "info": {
+                    "has_F_columns": False,
+                    "has_I_columns": False,
+                    "mislabeled_amplitudes_in_intensity_column": False,
+                    "sigma_missing_or_zero": True,
+                    "software": "Legacy sigma-less deposition (all SIGF/SIGI = 0 or missing; error-variance forensics unavailable)",
+                    "truncate_mode": "none",
+                    "inferred_min_isigi": None,
+                    "cutoff_reached": False,
+                },
+                "valid": v_ns,
+                "i_hat": ip_ns.copy(),
+                "sig_i_hat": np.full(n, np.nan, dtype=np.float64),
+                "i_post": ip_ns,
+                "sigma_source": "missing_or_zero_sigma",
+            }
         raise ValueError("No valid (F, SIGF) or (I, SIGI) observations found in file.")
 
     info: Dict[str, Any] = {
@@ -899,9 +1028,10 @@ def detect_geometry_and_pass_boundaries(
         asu_in_rows = np.zeros(0, dtype=bool)
         overall_compl = float("nan")
 
-    # 1. Distinguish square-detector corner roll-off vs spherical cutoff
+    # 1. Distinguish square-detector corner roll-off, STARANISO ellipsoidal truncation, and spherical cutoff
     cutoff_type = "spherical"
     inferred_d_edge = d_min_obs
+    ellipsoid_limits_a: Optional[List[float]] = None
     outer_compl = overall_compl
     if has_lattice and np.sum(asu_d <= d_max_obs) >= 200:
         s3 = 1.0 / (asu_d ** 3)
@@ -920,11 +1050,10 @@ def detect_geometry_and_pass_boundaries(
         if len(bin_c_a) >= 6:
             outer_compl = float(bin_c_a[-1])
             plateau_c = float(np.percentile(bin_c_a[1 : max(4, len(bin_c_a) - 6)], 75))
-            # Square-detector corners drop below 49% of plateau completeness in the outermost 1/d^3 bin
-            # (0.4% to 46.4% across 0.86-3.5 A), whereas spherical cutoffs (including 2-crystal 1AHO at 55.2% of plateau) stay higher.
+            # Square-detector corners and ellipsoidal (STARANISO) cutoffs both drop below 49% of plateau completeness
+            # in the outermost 1/d^3 bin. Separate them via 3D directional resolution limits along principal axes!
             if outer_compl < 0.49 * plateau_c:
                 cutoff_type = "detector_corners"
-                # 3D rotating-crystal ASU corner survival curve p_obs(u = d_edge / d) from Pilatus/square geometry
                 u_3d = np.array([0.0, 0.99, 1.02, 1.05, 1.09, 1.14, 1.22, 1.30, 1.38], dtype=np.float64)
                 p_3d = np.array([1.0, 1.00, 0.99, 0.92, 0.73, 0.52, 0.21, 0.10, 0.03], dtype=np.float64)
                 best_err = float("inf")
@@ -939,10 +1068,54 @@ def detect_geometry_and_pass_boundaries(
                         best_de = float(de_cand)
                 inferred_d_edge = best_de
 
+                # Check for ellipsoidal anisotropic cutoff (STARANISO / anisotropic truncation):
+                # Test both crystal reciprocal axes (a*, b*, c*) and observed <s s^T> eigenvectors.
+                # Under STARANISO, at least one direction present at low d (>=35% compl) is hard-cut to ~0% at high d!
+                orth_el = reciprocal_cartesian_matrix(cell)
+                s_obs_vec = hkls_obs @ orth_el.T
+                if len(s_obs_vec) >= 150:
+                    cov_s = (s_obs_vec.T @ s_obs_vec) / float(len(s_obs_vec))
+                    _, eig_vecs = np.linalg.eigh(cov_s)
+                    ax_unit = orth_el / np.maximum(np.linalg.norm(orth_el, axis=0, keepdims=True), 1e-12)
+                    s_obs_u = s_obs_vec / np.maximum(np.linalg.norm(s_obs_vec, axis=1, keepdims=True), 1e-12)
+                    s_asu_vec = asu_hkls[m_in] @ orth_el.T
+                    s_asu_u = s_asu_vec / np.maximum(np.linalg.norm(s_asu_vec, axis=1, keepdims=True), 1e-12)
+                    d_asu_in = asu_d[m_in]
+                    pres_in = asu_present[m_in]
+
+                    for basis_mat in (ax_unit, eig_vecs):
+                        d_obs_caps, rel_caps, cap_vecs = [], [], []
+                        for k_ax in range(3):
+                            vk = basis_mat[:, k_ax]
+                            in_obs_k = np.abs(s_obs_u @ vk) >= 0.819  # 35 deg half-angle cap
+                            in_asu_k = np.abs(s_asu_u @ vk) >= 0.819
+                            if int(np.sum(in_obs_k)) >= 12 and int(np.sum(in_asu_k)) >= 20:
+                                d_ok = float(np.percentile(d_obs[in_obs_k], 1.5))
+                                d_ak = float(np.percentile(d_asu_in[in_asu_k], 1.5))
+                                d_obs_caps.append(d_ok)
+                                rel_caps.append(d_ok / max(d_ak, 1e-6))
+                                cap_vecs.append(in_asu_k)
+                        if len(d_obs_caps) == 3:
+                            idx_worst = int(np.argmax(rel_caps))
+                            d_worst = d_obs_caps[idx_worst]
+                            aniso_d_rat = max(rel_caps) / max(min(rel_caps), 1e-6)
+                            low_core_m = cap_vecs[idx_worst] & (d_asu_in >= 1.08 * d_worst)
+                            hi_tip_m = cap_vecs[idx_worst] & (d_asu_in <= 0.94 * d_worst)
+                            low_core_c = float(np.mean(pres_in[low_core_m])) if int(np.sum(low_core_m)) >= 10 else 0.0
+                            hi_tip_c = float(np.mean(pres_in[hi_tip_m])) if int(np.sum(hi_tip_m)) >= 10 else 1.0
+                            if aniso_d_rat >= 1.15 and low_core_c >= 0.35 and hi_tip_c <= 0.05:
+                                cutoff_type = "ellipsoidal_anisotropic"
+                                inferred_d_edge = float(d_worst)
+                                ellipsoid_limits_a = [round(x, 3) for x in sorted(d_obs_caps)]
+                                break
+
     # 2. Spindle / capillary axis detection via reciprocal-space Lorentz blind cone
     spindle_info: Dict[str, Any] = {"detected": False, "axis": None, "axis_completeness": {}}
     if has_lattice:
-        d_cone_cut = max(d_min_obs, inferred_d_edge if cutoff_type == "detector_corners" else d_min_obs)
+        d_cone_cut = max(
+            d_min_obs,
+            inferred_d_edge if cutoff_type in ("detector_corners", "ellipsoidal_anisotropic") else d_min_obs,
+        )
         m_cone = (asu_d >= d_cone_cut) & (asu_d <= min(d_max_obs, 15.0))
         if np.sum(m_cone) >= 150:
             orth_frac = reciprocal_cartesian_matrix(cell)
@@ -1146,6 +1319,7 @@ def detect_geometry_and_pass_boundaries(
         "outer_shell_completeness": outer_compl,
         "cutoff_type": cutoff_type,
         "inferred_d_edge_A": float(inferred_d_edge),
+        "ellipsoidal_principal_d_limits_A": ellipsoid_limits_a,
         "spindle_blind_cone": spindle_info,
         "low_angle_overloads": overload_info,
         "pass_boundaries": changepoints,
@@ -1229,6 +1403,7 @@ def estimate_absolute_electron_wilson(
     edges_q[0] -= 1e-9
     edges_q[-1] += 1e-9
 
+    has_sig_v = bool(np.any(np.isfinite(sh_v) & (sh_v > 0.0)))
     sh_s2, sh_d, sh_ie, sh_cc12, sh_isig, sh_n = [], [], [], [], [], []
     for j in range(n_sh):
         m = (s2_v >= edges_q[j]) & (s2_v <= edges_q[j + 1])
@@ -1236,8 +1411,12 @@ def estimate_absolute_electron_wilson(
             continue
         s2_m = float(np.mean(s2_v[m]))
         d_m = 0.5 / math.sqrt(max(s2_m, 1e-12))
-        cc12_m = compute_cc12_from_sigi(ih_v[m], sh_v[m])
-        isig_m = float(np.mean(ih_v[m] / sh_v[m]))
+        if has_sig_v:
+            cc12_m = compute_cc12_from_sigi(ih_v[m], sh_v[m])
+            isig_m = float(np.nanmean(ih_v[m] / sh_v[m]))
+        else:
+            cc12_m = float("nan")
+            isig_m = 5.0
         mean_ih = float(np.mean(ih_v[m] / ep_v[m]))
         mean_ip = float(np.mean(ip_v[m] / ep_v[m]))
         ie_m = mean_ih if mean_ih > 0.20 * mean_ip else 0.5 * max(mean_ih, 0.0) + 0.5 * mean_ip
@@ -1245,8 +1424,8 @@ def estimate_absolute_electron_wilson(
             sh_s2.append(s2_m)
             sh_d.append(d_m)
             sh_ie.append(ie_m)
-            sh_cc12.append(cc12_m if np.isfinite(cc12_m) else 0.0)
-            sh_isig.append(isig_m)
+            sh_cc12.append(cc12_m if np.isfinite(cc12_m) else (1.0 if not has_sig_v else 0.0))
+            sh_isig.append(isig_m if np.isfinite(isig_m) else 5.0)
             sh_n.append(int(np.sum(m)))
 
     sh_s2_a = np.asarray(sh_s2, dtype=np.float64)
@@ -1257,20 +1436,28 @@ def estimate_absolute_electron_wilson(
     sh_n_a = np.asarray(sh_n, dtype=np.float64)
 
     d_min_v = float(np.min(d_v))
-    d_cc12, cc12_crossed = _crossing_d(sh_d_a, sh_cc_a, 0.30, d_min_v)
-    d_isig15, isig15_crossed = _crossing_d(sh_d_a, sh_is_a, 1.50, d_min_v)
-    d_isig20, isig20_crossed = _crossing_d(sh_d_a, sh_is_a, 2.00, d_min_v)
+    if has_sig_v:
+        d_cc12, cc12_crossed = _crossing_d(sh_d_a, sh_cc_a, 0.30, d_min_v)
+        d_isig15, isig15_crossed = _crossing_d(sh_d_a, sh_is_a, 1.50, d_min_v)
+        d_isig20, isig20_crossed = _crossing_d(sh_d_a, sh_is_a, 2.00, d_min_v)
+    else:
+        d_cc12, cc12_crossed = d_min_v, False
+        d_isig15, isig15_crossed = d_min_v, False
+        d_isig20, isig20_crossed = d_min_v, False
 
     # Universal Debye-Babinet radial modulation D_prot(s) allows reliable shells down to d = 9 A (s2 >= 0.003)!
     sh_s_mag = np.sqrt(sh_s2_a)
     d_prot_sh = np.interp(sh_s_mag, _DEBYE_S_KNOTS, _DEBYE_D_PROT)
 
-    # Raw apparent Wilson B (before T_xds de-rolloff)
+    # Raw apparent Wilson B (before T_xds de-rolloff); restrict to complete isotropic core for both
+    # square-detector corners and STARANISO ellipsoidal cutoffs to avoid outer directional survivorship bias!
     good_w = (sh_s2_a >= 0.004) & ((sh_cc_a >= 0.30) | (sh_is_a >= 1.10))
-    if geom_info["cutoff_type"] == "detector_corners":
+    if geom_info["cutoff_type"] in ("detector_corners", "ellipsoidal_anisotropic"):
         good_w = good_w & (sh_d_a >= 0.98 * geom_info["inferred_d_edge_A"])
     if np.sum(good_w) < 4:
         good_w = (sh_cc_a >= 0.18) | (sh_is_a >= 0.60)
+        if geom_info["cutoff_type"] == "ellipsoidal_anisotropic" and int(np.sum(good_w & (sh_d_a >= 0.95 * geom_info["inferred_d_edge_A"]))) >= 3:
+            good_w = good_w & (sh_d_a >= 0.95 * geom_info["inferred_d_edge_A"])
     if np.sum(good_w) < 3:
         good_w = sh_ie_a > 0.0
 
@@ -1372,6 +1559,35 @@ def fit_variance_and_anisotropy(
 ) -> Dict[str, Any]:
     """Fit SIGI_ref^2 = sigma_bg^2(d) + g_shot * I + c_merged^2 * I^2 jointly across (shell, I-octile),
     plus directional SIGF anisotropy, symmetry-multiplicity scaling exponent, and per-zone fits."""
+    if not bool(np.any(np.isfinite(sig_i_e2) & (sig_i_e2 > 0.0))):
+        return {
+            "global": {
+                "n": int(len(d)),
+                "sigma_bg_med_e2": float("nan"),
+                "sigma_bg_lows_e2": float("nan"),
+                "sigma_bg_highs_e2": float("nan"),
+                "g_shot_e2_per_ph": 0.0,
+                "c_merged": 0.0,
+                "rms_ln_si": float("nan"),
+                "shells_s": [],
+                "shells_d": [],
+                "shells_bg_e2": [],
+            },
+            "g_shot_best_e2_per_ph": 0.0,
+            "outer_pass_g_shot_e2_per_ph": 0.0,
+            "zones": [],
+            "alpha_multiplicity_exp": None,
+            "anisotropy": {},
+            "paired_friedel_fraction": None,
+            "wedge_deg_from_isym": None,
+            "background_profile": {
+                "mount_regime": "Unavailable (sigma-less deposition: all SIGF/SIGI = 0 or missing)",
+                "is_rt_capillary": False,
+                "has_ice_rings": False,
+                "max_ice_spike_ratio": 1.0,
+            },
+            "anomalous_sigma_model": {"detected": False},
+        }
     d_edg = geom_info["inferred_d_edge_A"]
     if geom_info["cutoff_type"] == "detector_corners":
         u_det = d_edg / np.maximum(d, 0.25)
@@ -1642,7 +1858,7 @@ def fit_variance_and_anisotropy(
                 mount_str = f"Cryogenic loop with crystalline ice ring contamination (max ice spike {max_ice_spike:.2f}x)"
                 is_rt_capillary = False
             elif f_wat > 0.12:
-                mount_str = "Cryogenic loop / vitreous water ring (~3.15 A peak, no silica capillary hump)"
+                mount_str = "Loop / thin-film solvent mount (~3.15 A water ring; 100 K cryo or capillary-free RT, no ice)"
                 is_rt_capillary = False
             elif f_air < 0.06 and f_wat < 0.08:
                 mount_str = "Low-background / helium-or-vacuum path or large crystal dominating solvent/air scatter"
@@ -1725,7 +1941,9 @@ def deduce_physical_parameters_and_replay(
     d_file_min = wilson_info["d_file_min"]
     d_cc12 = wilson_info["d_cc12_030"]
     d_edg_obs = geom_info["inferred_d_edge_A"]
-    g_shot_e2 = max(var_info["g_shot_best_e2_per_ph"], 1e-6)
+    raw_g_shot = float(var_info["g_shot_best_e2_per_ph"])
+    g_shot_resolved = bool(np.isfinite(raw_g_shot) and raw_g_shot > 1e-5)
+    g_shot_e2 = max(raw_g_shot, 1e-6)
     g_outer_e2 = max(var_info["outer_pass_g_shot_e2_per_ph"], 1e-6)
     c_merged = var_info["global"]["c_merged"]
 
@@ -1745,20 +1963,35 @@ def deduce_physical_parameters_and_replay(
 
     r_e_um = 2.81794e-9
     v_cell_um3 = v_cell_a3 * 1e-12
-    darwin_prod_um_a3 = (
+    darwin_prod_um_a3: Optional[float] = (
         (2.0 * math.pi * (v_cell_um3 ** 2))
         / (float(m_max) * (r_e_um ** 2) * 1e-12 * lp_eff * g_shot_e2)
+        if g_shot_resolved
+        else None
     )
 
     # 3. Radiation-damage lower bound on illuminated crystal volume V_illum (Holton 2009: 2e10 ph/um^2/MGy at 1 A)
     is_rt = bool(var_info["background_profile"].get("is_rt_capillary", False))
-    v_min_cryo_20mgy = darwin_prod_um_a3 / (2.0e10 * 20.0 * lam_nom)
-    v_min_rt_30kgy = darwin_prod_um_a3 / (2.0e10 * 0.030 * lam_nom)
-    v_min_rt_2kgy = darwin_prod_um_a3 / (2.0e10 * 0.002 * lam_nom)
-
-    l_min_cryo_um = v_min_cryo_20mgy ** (1.0 / 3.0)
-    l_min_rt_30kgy_um = v_min_rt_30kgy ** (1.0 / 3.0)
-    l_min_rt_2kgy_um = v_min_rt_2kgy ** (1.0 / 3.0)
+    has_ice = bool(var_info["background_profile"].get("has_ice_rings", False))
+    active_temp_regime = (
+        "Room-temperature capillary"
+        if is_rt
+        else ("Cryogenic (<273 K, ice-confirmed)" if has_ice else "Cryogenic (100 K) or capillary-free RT")
+    )
+    if darwin_prod_um_a3 is not None:
+        v_min_cryo_20mgy: Optional[float] = darwin_prod_um_a3 / (2.0e10 * 20.0 * lam_nom)
+        v_min_rt_30kgy: Optional[float] = darwin_prod_um_a3 / (2.0e10 * 0.030 * lam_nom)
+        v_min_rt_2kgy: Optional[float] = darwin_prod_um_a3 / (2.0e10 * 0.002 * lam_nom)
+        l_min_cryo_um: Optional[float] = v_min_cryo_20mgy ** (1.0 / 3.0)
+        l_min_rt_30kgy_um: Optional[float] = v_min_rt_30kgy ** (1.0 / 3.0)
+        l_min_rt_2kgy_um: Optional[float] = v_min_rt_2kgy ** (1.0 / 3.0)
+    else:
+        v_min_cryo_20mgy = None
+        v_min_rt_30kgy = None
+        v_min_rt_2kgy = None
+        l_min_cryo_um = None
+        l_min_rt_30kgy_um = None
+        l_min_rt_2kgy_um = None
 
     # 4. Exact inversion against nanoBragg2 / sim_reso_mtz reference model
     if geom_info["cutoff_type"] == "detector_corners":
@@ -1769,62 +2002,66 @@ def deduce_physical_parameters_and_replay(
     d_edg_ref = float(cal_g["d_edge"])
     scale_k0_vs_1aho = wilson_info["k0_abs_e2"] / float(cal["K0_ref_1aho"])
     g_ref_abs = float(cal_g["g_shot"]) * scale_k0_vs_1aho
-    gamma_g_obs_inferred = g_ref_abs / max(g_shot_e2, 1e-6)
-
     gamma_cell_phys = ((NB2_REF["cell_vol_A3"] / max(v_cell_a3, 100.0)) ** 2) * scale_k0_vs_1aho
-    nb2_photon_product_ratio = gamma_g_obs_inferred / max(gamma_cell_phys, 1e-12)
-
-    v_equiv_nb2_um3 = NB2_REF["xtal_vol_um3"] * nb2_photon_product_ratio
-    l_equiv_nb2_um = max(0.1, v_equiv_nb2_um3) ** (1.0 / 3.0)
 
     est_water_um: Optional[float] = None
     est_air_mm: Optional[float] = None
-    sh_s = np.asarray(var_info["global"]["shells_s"], dtype=np.float64)
-    sh_bg = np.asarray(var_info["global"]["shells_bg_e2"], dtype=np.float64)
-    if len(sh_s) >= 4:
-        u_sh = (d_edg_obs if geom_info["cutoff_type"] == "detector_corners" else d_edg_ref) * (2.0 * sh_s)
-        wat_b = np.exp(-(((sh_s - 0.160) / 0.045) ** 2))
-        cor_b = np.maximum(0.0, u_sh - 0.95) ** 2
-        sig_bg0_sh = (float(cal_g["sig0"]) * scale_k0_vs_1aho) * np.exp(
-            float(cal_g["b1_u2"]) * (u_sh * u_sh)
-            + float(cal_g["w_wat"]) * wat_b
-            + float(cal_g.get("b2_cor", 0.0)) * cor_b
-        )
-        bg_var_mult_obs = (sh_bg / np.maximum(sig_bg0_sh, 1e-12)) ** 2
+    if g_shot_resolved:
+        gamma_g_obs_inferred = g_ref_abs / g_shot_e2
+        nb2_photon_product_ratio: Optional[float] = gamma_g_obs_inferred / max(gamma_cell_phys, 1e-12)
+        v_equiv_nb2_um3: Optional[float] = NB2_REF["xtal_vol_um3"] * nb2_photon_product_ratio
+        l_equiv_nb2_um: Optional[float] = max(0.1, v_equiv_nb2_um3) ** (1.0 / 3.0)
 
-        f_wat2 = np.interp(sh_s, _STOL_GRID, _F_WATER_GRID) ** 2
-        f_air2 = np.interp(sh_s, _STOL_GRID, _F_AIR_GRID) ** 2
-        a_beam0 = NB2_REF["beam_size_um"] ** 2
-        s_air0 = (a_beam0 * (1000.0 * NB2_REF["air_mm"])) * (1.2e-3 / 28.0) * f_air2
-        s_wat0 = (a_beam0 * NB2_REF["water_um"]) * (1.0 / 18.0) * f_wat2
-        s_xtl0 = NB2_REF["incoh_vol_um3"] * (1.2 / 16.0) * nonbragg_incoherent_f2(
-            sh_s, float(cal_g["B_Wilson"]), NB2_REF["wavelength_A"]
-        )
-        tot0 = s_air0 + s_wat0 + s_xtl0
-
-        a_beam_est = max(a_beam0, l_equiv_nb2_um ** 2)
-        gamma_vol_est = v_equiv_nb2_um3 / NB2_REF["xtal_vol_um3"]
-        s_xtl_est = (NB2_REF["incoh_vol_um3"] * gamma_vol_est) * (1.2 / 16.0) * nonbragg_incoherent_f2(
-            sh_s, wilson_info["B_Wilson_pre_transfer_nb2"], NB2_REF["wavelength_A"]
-        )
-        lhs = bg_var_mult_obs * (gamma_g_obs_inferred ** 2) * tot0 - s_xtl_est
-        m_fit = u_sh <= 0.96
-        if geom_info["pass_boundaries"]:
-            s_cut_pass = 0.5 / max(float(geom_info["pass_boundaries"][0]["d_A"]), 0.25)
-            if int(np.sum(m_fit & (sh_s < s_cut_pass))) >= 3:
-                m_fit = m_fit & (sh_s < s_cut_pass)
-            else:
-                m_fit = np.zeros_like(m_fit, dtype=bool)
-        if np.sum(m_fit) >= 3:
-            col_air = (a_beam_est * 1000.0) * (1.2e-3 / 28.0) * f_air2[m_fit]
-            col_wat = a_beam_est * (1.0 / 18.0) * f_wat2[m_fit]
-            w_s = 1.0 / np.maximum(tot0[m_fit], 1.0)
-            c_aw = exact_nnls(
-                np.column_stack([col_air * w_s, col_wat * w_s]),
-                np.maximum(lhs[m_fit], 0.0) * w_s,
+        sh_s = np.asarray(var_info["global"]["shells_s"], dtype=np.float64)
+        sh_bg = np.asarray(var_info["global"]["shells_bg_e2"], dtype=np.float64)
+        if len(sh_s) >= 4:
+            u_sh = (d_edg_obs if geom_info["cutoff_type"] == "detector_corners" else d_edg_ref) * (2.0 * sh_s)
+            wat_b = np.exp(-(((sh_s - 0.160) / 0.045) ** 2))
+            cor_b = np.maximum(0.0, u_sh - 0.95) ** 2
+            sig_bg0_sh = (float(cal_g["sig0"]) * scale_k0_vs_1aho) * np.exp(
+                float(cal_g["b1_u2"]) * (u_sh * u_sh)
+                + float(cal_g["w_wat"]) * wat_b
+                + float(cal_g.get("b2_cor", 0.0)) * cor_b
             )
-            est_air_mm = round(max(0.0, float(c_aw[0])), 1) + 0.0
-            est_water_um = round(max(0.0, float(c_aw[1])), 1) + 0.0
+            bg_var_mult_obs = (sh_bg / np.maximum(sig_bg0_sh, 1e-12)) ** 2
+
+            f_wat2 = np.interp(sh_s, _STOL_GRID, _F_WATER_GRID) ** 2
+            f_air2 = np.interp(sh_s, _STOL_GRID, _F_AIR_GRID) ** 2
+            a_beam0 = NB2_REF["beam_size_um"] ** 2
+            s_air0 = (a_beam0 * (1000.0 * NB2_REF["air_mm"])) * (1.2e-3 / 28.0) * f_air2
+            s_wat0 = (a_beam0 * NB2_REF["water_um"]) * (1.0 / 18.0) * f_wat2
+            s_xtl0 = NB2_REF["incoh_vol_um3"] * (1.2 / 16.0) * nonbragg_incoherent_f2(
+                sh_s, float(cal_g["B_Wilson"]), NB2_REF["wavelength_A"]
+            )
+            tot0 = s_air0 + s_wat0 + s_xtl0
+
+            a_beam_est = max(a_beam0, l_equiv_nb2_um ** 2)
+            gamma_vol_est = v_equiv_nb2_um3 / NB2_REF["xtal_vol_um3"]
+            s_xtl_est = (NB2_REF["incoh_vol_um3"] * gamma_vol_est) * (1.2 / 16.0) * nonbragg_incoherent_f2(
+                sh_s, wilson_info["B_Wilson_pre_transfer_nb2"], NB2_REF["wavelength_A"]
+            )
+            lhs = bg_var_mult_obs * (gamma_g_obs_inferred ** 2) * tot0 - s_xtl_est
+            m_fit = u_sh <= 0.96
+            if geom_info["pass_boundaries"]:
+                s_cut_pass = 0.5 / max(float(geom_info["pass_boundaries"][0]["d_A"]), 0.25)
+                if int(np.sum(m_fit & (sh_s < s_cut_pass))) >= 3:
+                    m_fit = m_fit & (sh_s < s_cut_pass)
+                else:
+                    m_fit = np.zeros_like(m_fit, dtype=bool)
+            if np.sum(m_fit) >= 3:
+                col_air = (a_beam_est * 1000.0) * (1.2e-3 / 28.0) * f_air2[m_fit]
+                col_wat = a_beam_est * (1.0 / 18.0) * f_wat2[m_fit]
+                w_s = 1.0 / np.maximum(tot0[m_fit], 1.0)
+                c_aw = exact_nnls(
+                    np.column_stack([col_air * w_s, col_wat * w_s]),
+                    np.maximum(lhs[m_fit], 0.0) * w_s,
+                )
+                est_air_mm = round(max(0.0, float(c_aw[0])), 1) + 0.0
+                est_water_um = round(max(0.0, float(c_aw[1])), 1) + 0.0
+    else:
+        nb2_photon_product_ratio = None
+        v_equiv_nb2_um3 = None
+        l_equiv_nb2_um = None
 
     b_nb2_pre_transfer = max(2.0, wilson_info["B_Wilson_pre_transfer_nb2"])
     db_xds_rolloff = wilson_info["B_Wilson_apparent_nb2"] - wilson_info["B_Wilson_pre_transfer_nb2"]
@@ -1845,7 +2082,7 @@ def deduce_physical_parameters_and_replay(
         cli_parts.append(f"{d_file_min:.3f}")
         cli_parts.append(f"--B-wilson {b_nb2_pre_transfer:.2f}")
 
-    if geom_info["cutoff_type"] == "spherical":
+    if geom_info["cutoff_type"] in ("spherical", "ellipsoidal_anisotropic"):
         cli_parts.append("--cutoff dmin --ideal-transfer")
 
     t_mode = conv_info.get("truncate_mode", "xdsconv")
@@ -1860,7 +2097,7 @@ def deduce_physical_parameters_and_replay(
     if abs(v_cell_a3 - NB2_REF["cell_vol_A3"]) / NB2_REF["cell_vol_A3"] > 0.03:
         cli_parts.append("--scale-by-cell")
 
-    if abs(l_equiv_nb2_um - 25.99) > 1.5:
+    if l_equiv_nb2_um is not None and abs(l_equiv_nb2_um - 25.99) > 1.5:
         cli_parts.append(f"--xtal-size-um {l_equiv_nb2_um:.2f}")
     if est_water_um is not None and abs(est_water_um - NB2_REF["water_um"]) > 6.0:
         cli_parts.append(f"--water-um {est_water_um:.1f}")
@@ -1868,7 +2105,7 @@ def deduce_physical_parameters_and_replay(
         cli_parts.append(f"--air-mm {est_air_mm:.1f}")
     if var_info["wedge_deg_from_isym"] is not None:
         cli_parts.append(f"--wedge-deg {var_info['wedge_deg_from_isym']:.1f}")
-    if abs(est_calib_err - NB2_REF["calib_err"]) > 0.004:
+    if not conv_info.get("sigma_missing_or_zero") and abs(est_calib_err - NB2_REF["calib_err"]) > 0.004:
         cli_parts.append(f"--calib-err {est_calib_err:.4f}")
 
     return {
@@ -1878,7 +2115,8 @@ def deduce_physical_parameters_and_replay(
             "assumed_nominal_wavelength_A": round(float(lam_nom), 4),
             "cc12_estimated_from_sigi_not_halfdatasets": True,
         },
-        "darwin_invariant_phi_V_lam3_um_A3": float(darwin_prod_um_a3),
+        "g_shot_resolved": bool(g_shot_resolved),
+        "darwin_invariant_phi_V_lam3_um_A3": float(darwin_prod_um_a3) if darwin_prod_um_a3 is not None else None,
         "wavelength_bounds_A": {
             "practical_flat_detector_max_2th65": lam_practical_max,
             "physical_backscatter_max_2th180": lam_backscatter_max,
@@ -1886,17 +2124,17 @@ def deduce_physical_parameters_and_replay(
             "assumed_nominal_wavelength_for_LP_and_dose_A": round(float(lam_nom), 4),
         },
         "crystal_size_lower_bounds": {
-            "active_regime": "Room-temperature capillary" if is_rt else "Cryogenic (100 K)",
-            "min_edge_um_cryo_20MGy": round(l_min_cryo_um, 1),
-            "min_vol_um3_cryo_20MGy": round(v_min_cryo_20mgy, 1),
-            "min_edge_um_RT_30kGy": round(l_min_rt_30kgy_um, 1),
-            "min_edge_um_RT_2kGy_low_decay": round(l_min_rt_2kgy_um, 1),
+            "active_regime": active_temp_regime,
+            "min_edge_um_cryo_20MGy": round(l_min_cryo_um, 1) if l_min_cryo_um is not None else None,
+            "min_vol_um3_cryo_20MGy": round(v_min_cryo_20mgy, 1) if v_min_cryo_20mgy is not None else None,
+            "min_edge_um_RT_30kGy": round(l_min_rt_30kgy_um, 1) if l_min_rt_30kgy_um is not None else None,
+            "min_edge_um_RT_2kGy_low_decay": round(l_min_rt_2kgy_um, 1) if l_min_rt_2kgy_um is not None else None,
         },
         "nanobragg2_equivalent": {
-            "photon_budget_ratio_vs_nb2": round(nb2_photon_product_ratio, 4),
-            "equiv_xtal_vol_um3_at_nb2_fluence": round(v_equiv_nb2_um3, 1),
-            "equiv_xtal_edge_um_at_nb2_fluence": round(l_equiv_nb2_um, 2),
-            "equiv_exposure_s_at_nb2_xtal": round(NB2_REF["exposure_s"] * nb2_photon_product_ratio, 2),
+            "photon_budget_ratio_vs_nb2": round(nb2_photon_product_ratio, 4) if nb2_photon_product_ratio is not None else None,
+            "equiv_xtal_vol_um3_at_nb2_fluence": round(v_equiv_nb2_um3, 1) if v_equiv_nb2_um3 is not None else None,
+            "equiv_xtal_edge_um_at_nb2_fluence": round(l_equiv_nb2_um, 2) if l_equiv_nb2_um is not None else None,
+            "equiv_exposure_s_at_nb2_xtal": round(NB2_REF["exposure_s"] * nb2_photon_product_ratio, 2) if nb2_photon_product_ratio is not None else None,
             "inferred_B_Wilson_pre_transfer_nb2": round(b_nb2_pre_transfer, 2),
             "estimated_xds_rolloff_dB_A2": round(db_xds_rolloff, 2),
             "inferred_pilatus_dist_mm_at_0p98A": round(dist_from_dedge(d_edg_obs, NB2_REF["wavelength_A"]), 1),
@@ -2306,9 +2544,11 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
         f"  Resolution limits : file d_min = {wr['d_file_min']:.3f} A | est. CC1/2(SIGI)=0.30 at {cc_note} | "
         f"<I/sigI>=2.0 at {wr['d_isig20']:.3f} A"
     )
+    el_lims = gp.get("ellipsoidal_principal_d_limits_A")
+    el_str = f", principal limits={el_lims} A" if el_lims else ""
     lines.append(
-        f"  Outer geometry    : {gp['cutoff_type']} (inferred inscribed d_edge = {gp['inferred_d_edge_A']:.3f} A, "
-        f"outer-shell compl = {100*gp['outer_shell_completeness']:.1f}%)"
+        f"  Outer geometry    : {gp['cutoff_type']} (inferred isotropic/inscribed d_edge = {gp['inferred_d_edge_A']:.3f} A, "
+        f"outer-shell compl = {100*gp['outer_shell_completeness']:.1f}%{el_str})"
     )
 
     lines.extend(
@@ -2341,10 +2581,13 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
         lines.append(f"  Spindle / mount   : No missing blind cone ({ax_c or 'isotropic completeness'})")
 
     an = va["anisotropy"]
-    ax_s = ", ".join(f"{k}:{v:.2f}x" for k, v in an.get("axes_rel_sigma", {}).items())
-    m_exp = f", M_pg exp = {va['alpha_multiplicity_exp']:.2f} [ideal 360d = 0.50]" if va["alpha_multiplicity_exp"] is not None else ""
-    w_isym = f", ISYM wedge ~ {va['wedge_deg_from_isym']:.0f} deg" if va["wedge_deg_from_isym"] is not None else ""
-    lines.append(f"  SIGF anisotropy   : max/min = {an['anisotropy_ratio_max_min']:.2f}x ({ax_s}){m_exp}{w_isym}")
+    if "anisotropy_ratio_max_min" in an:
+        ax_s = ", ".join(f"{k}:{v:.2f}x" for k, v in an.get("axes_rel_sigma", {}).items())
+        m_exp = f", M_pg exp = {va['alpha_multiplicity_exp']:.2f} [ideal 360d = 0.50]" if va["alpha_multiplicity_exp"] is not None else ""
+        w_isym = f", ISYM wedge ~ {va['wedge_deg_from_isym']:.0f} deg" if va["wedge_deg_from_isym"] is not None else ""
+        lines.append(f"  SIGF anisotropy   : max/min = {an['anisotropy_ratio_max_min']:.2f}x ({ax_s}){m_exp}{w_isym}")
+    else:
+        lines.append("  SIGF anisotropy   : unavailable (insufficient directional sigma coverage or sigma-less deposition)")
 
     ov = gp["low_angle_overloads"]
     if ov.get("detected"):
@@ -2395,23 +2638,37 @@ def format_deduction_report(res: Dict[str, Any]) -> str:
     )
     cu_str = " [1.54 A Cu K-alpha RULED OUT -> synchrotron/Mo]" if wb["cu_kalpha_1p54A_ruled_out"] else ""
     hdr_wl = f" (file header wavelength = {fm['header_wavelength_A_not_used_in_blind_fit']:.4f} A, unused)" if fm["header_wavelength_A_not_used_in_blind_fit"] else ""
-    lines.extend(
-        [
-            "",
-            "5. Deduceable Physical Invariants, Inequalities & nanoBragg2-Equivalent Setup:",
+    lines.append("")
+    lines.append("5. Deduceable Physical Invariants, Inequalities & nanoBragg2-Equivalent Setup:")
+    if pd["darwin_invariant_phi_V_lam3_um_A3"] is not None:
+        lines.append(
             f"  Darwin invariant  : Phi_tot * V_illum * lambda^3 * DQE = {pd['darwin_invariant_phi_V_lam3_um_A3']:.3e} ph * um * A^3 "
-            f"({nb['photon_budget_ratio_vs_nb2']:.3f}x nanoBragg2 baseline; LP at assumed lambda~{lam_assump:.2f}A{sc_assump_tag})",
-            f"  Wavelength bound  : lambda <= {wb['practical_flat_detector_max_2th65']:.3f} A (flat det 2th<=65d), "
-            f"< {wb['physical_backscatter_max_2th180']:.3f} A (2th<180d){cu_str}{hdr_wl}",
+            f"({nb['photon_budget_ratio_vs_nb2']:.3f}x nanoBragg2 baseline; LP at assumed lambda~{lam_assump:.2f}A{sc_assump_tag})"
+        )
+    else:
+        lines.append(
+            "  Darwin invariant  : unresolved (shot-noise slope g_shot <= 0; errors dominated by flat background, "
+            "serial hit-multiplicity, or missing sigmas)"
+        )
+    lines.append(
+        f"  Wavelength bound  : lambda <= {wb['practical_flat_detector_max_2th65']:.3f} A (flat det 2th<=65d), "
+        f"< {wb['physical_backscatter_max_2th180']:.3f} A (2th<180d){cu_str}{hdr_wl}"
+    )
+    if cs["min_edge_um_cryo_20MGy"] is not None:
+        lines.append(
             f"  Min crystal size  : >= {cs['min_edge_um_cryo_20MGy']:.1f} um at 100K cryo (<=20 MGy) | "
             f">= {cs['min_edge_um_RT_30kGy']:.0f}-{cs['min_edge_um_RT_2kGy_low_decay']:.0f} um at RT capillary (30-2 kGy) "
-            f"[active: {cs['active_regime']}; assumes lambda~{lam_assump:.2f}A{sc_assump_tag}]",
+            f"[active: {cs['active_regime']}; assumes lambda~{lam_assump:.2f}A{sc_assump_tag}]"
+        )
+        lines.append(
             f"  nanoBragg2 equiv  : L_xtal = {nb['equiv_xtal_edge_um_at_nb2_fluence']:.2f} um (V = {nb['equiv_xtal_vol_um3_at_nb2_fluence']:.0f} um^3) "
             f"at 4e10 ph/um^2 [or t_exp = {nb['equiv_exposure_s_at_nb2_xtal']:.2f} s at 26 um xtal], "
-            f"water ~ {nb['inferred_water_um']} um, air ~ {nb['inferred_air_mm']} mm, calib_err ~ {100*nb['inferred_calib_err']:.2f}%{sc_assump_tag}",
-            f"  Replay CLI        : {pd['suggested_replay_command']}",
-        ]
-    )
+            f"water ~ {nb['inferred_water_um']} um, air ~ {nb['inferred_air_mm']} mm, calib_err ~ {100*nb['inferred_calib_err']:.2f}%{sc_assump_tag}"
+        )
+    else:
+        lines.append("  Min crystal size  : unresolved (requires positive Poisson shot-noise slope g_shot > 0)")
+        lines.append(f"  nanoBragg2 equiv  : crystal size / water / air unresolved (g_shot <= 0), calib_err ~ {100*nb['inferred_calib_err']:.2f}%")
+    lines.append(f"  Replay CLI        : {pd['suggested_replay_command']}")
 
     if sa.get("available"):
         ov_s = sa["overall"]
